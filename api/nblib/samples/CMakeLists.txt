@@ -39,51 +39,12 @@
 set(argon "argon-forces-integration")
 add_executable(${argon} argon-forces-integration.cpp)
 
+target_link_libraries(${argon} PRIVATE nblib)
+
 set(methane "methane-water-integration")
 add_executable(${methane} methane-water-integration.cpp)
 
-if (GMX_QMMM_DFTBPLUS)
-    LINK_DIRECTORIES(GMX_QMMM_DFTBPLUS_LIB)
-    add_library(libdftbplus STATIC IMPORTED)
-    set_target_properties(libdftbplus PROPERTIES IMPORTED_LOCATION ${GMX_QMMM_DFTBPLUS_LIB}/libdftbplus.a)
-#   add_library(libdftd3 STATIC IMPORTED)
-#   set_target_properties(libdftd3 PROPERTIES IMPORTED_LOCATION ${GMX_QMMM_DFTBPLUS_LIB}/libdftd3.a)
-#   add_library(libmudpack STATIC IMPORTED)
-#   set_target_properties(libmudpack PROPERTIES IMPORTED_LOCATION ${GMX_QMMM_DFTBPLUS_LIB}/libmudpack.a)
-
-    # search for the gfortran and gomp libraries in the system
-    # first look for possible library locations
-    unset(_lib_env)
-    string(REPLACE ":" ";" _lib_env "$ENV{LD_LIBRARY_PATH}")
-    list(APPEND _lib_env "${CMAKE_PLATFORM_IMPLICIT_LINK_DIRECTORIES}")
-    list(APPEND _lib_env "${CMAKE_C_IMPLICIT_LINK_DIRECTORIES}")
-    list(REMOVE_DUPLICATES _lib_env)
-    set(PATH_TO_LOOK_FOR "${_lib_env}")
-    # try to find the gfortran lib in the given paths and add it
-    find_library(GFORTRAN
-        NAMES libgfortran.so.5 libgfortran.so.4
-        HINTS ${PATH_TO_LOOK_FOR})
-    add_library(gfortran SHARED IMPORTED)
-    set_target_properties(gfortran PROPERTIES IMPORTED_LOCATION ${GFORTRAN})
-    # try to find the gomp lib in the given paths and add it
-    find_library(GOMP
-        NAMES libgomp.so.1 libgomp.so
-        HINTS ${PATH_TO_LOOK_FOR})
-    add_library(gomp SHARED IMPORTED)
-    set_target_properties(gomp PROPERTIES IMPORTED_LOCATION ${GOMP})
-
-    set_target_properties(${argon} PROPERTIES LINK_FLAGS
-      "-Wl,--whole-archive ${GMX_QMMM_DFTBPLUS_LIB}/libdftbplus.a -Wl,--no-whole-archive")
-    target_link_libraries(${argon} PRIVATE nblib libdftbplus ${LINEAR_ALGEBRA_LIBRARIES} gfortran gomp)
-   #target_link_libraries(${argon} PRIVATE nblib libdftbplus libdftd3 libmudpack gfortran gomp)
-
-    set_target_properties(${methane} PROPERTIES LINK_FLAGS
-      "-Wl,--whole-archive ${GMX_QMMM_DFTBPLUS_LIB}/libdftbplus.a -Wl,--no-whole-archive")
-    target_link_libraries(${methane} PRIVATE nblib libdftbplus ${LINEAR_ALGEBRA_LIBRARIES} gfortran gomp)
-else()
-    target_link_libraries(${argon} PRIVATE nblib)
-    target_link_libraries(${methane} PRIVATE nblib)
-endif()
+target_link_libraries(${methane} PRIVATE nblib)
 
 if(BUILD_TESTING)
     add_test(NAME NbLibSamplesTestArgon COMMAND ${argon})

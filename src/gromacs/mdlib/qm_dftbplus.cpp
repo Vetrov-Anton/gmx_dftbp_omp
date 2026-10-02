@@ -229,7 +229,9 @@ void init_dftbplus(QMMM_QMrec*       qm,
 
     static DftbPlus  calculator;
     DftbPlusInput    input;
+#if GMX_QMMM_DFTBPLUS_ATOM_LIST
     DftbPlusAtomList atomList;
+#endif
 
     /* This structure will be passed through DFTB+
      *   into the Gromacs calculator calcQMextPot
@@ -249,6 +251,14 @@ void init_dftbplus(QMMM_QMrec*       qm,
     /* Initialize the DFTB+ calculator */
     dftbp_init(&calculator, "dftb_in.out");
     printf("DFTB+ calculator has been created!\n");
+    {
+        int apiMajor = 0, apiMinor = 0, apiPatch = 0;
+        dftbp_api(&apiMajor, &apiMinor, &apiPatch);
+        printf("Linked DFTB+ C API version %d.%d.%d; QM atoms and species are taken %s.\n",
+               apiMajor, apiMinor, apiPatch,
+               GMX_QMMM_DFTBPLUS_ATOM_LIST ? "from the GROMACS topology"
+                                           : "from the Geometry block of dftb_in.hsd");
+    }
 
     /* Parse the input file and store the input-tree */
     dftbp_get_input_from_file(&calculator, "dftb_in.hsd", &input);
@@ -296,16 +306,36 @@ void init_dftbplus(QMMM_QMrec*       qm,
     for (int i=0; i<nAtom; i++)
         printf("Atom %d is species %d\n", i+1, ptrSpecies[i]);
 
+#if GMX_QMMM_DFTBPLUS_ATOM_LIST
     // finally, call the DFTB+ routine
     dftbp_get_atom_list(&atomList, &nAtom, &nSpecies, (char *) ptrElement, ptrSpecies);
     printf("DFTB+ has obtained the list of QM atoms!\n");
+#endif
 
     sfree(atomicNumber);
     sfree(ptrSpecies);
 
-    /* Set up the calculator by processing the input tree */
+    /* Set up the calculator by processing the input tree.
+     * Without the atom list (the C API of the DFTB+ releases), DFTB+ takes the atoms
+     *   from the Geometry block of dftb_in.hsd, which must therefore list the QM atoms
+     *   in the order of the QM group, with the species printed above.
+     */
+#if GMX_QMMM_DFTBPLUS_ATOM_LIST
     dftbp_process_input(&calculator, &input, &atomList);
+#else
+    dftbp_process_input(&calculator, &input);
+#endif
     printf("DFTB+ input has been processed!\n");
+
+    const int nAtomDftb = dftbp_get_nr_atoms(&calculator);
+    if (nAtomDftb != nAtom)
+    {
+        gmx_fatal(FARGS,
+                  "DFTB+ has %d atoms in the Geometry block of dftb_in.hsd, but the QM group of "
+                  "the run has %d atoms. The Geometry block must list the QM atoms in the order "
+                  "of the QM group.",
+                  nAtomDftb, nAtom);
+    }
 
     qm->dpcalc = &calculator;
 
@@ -390,9 +420,17 @@ real call_dftbplus(QMMM_rec*         qr,
 
         if ((env = getenv("GMX_DFTB_ATOMIC_SHIFTS")) != nullptr)
         {
-            output_freq_sh = atoi(env);
-            f_sh = fopen("qm_dftb_atomic_shifts.xvg", "a");
-            printf("The QM atomic shifts will be saved in file qm_dftb_atomic_shifts.xvg every %d steps.\n", output_freq_sh);
+            if (GMX_QMMM_DFTBPLUS_ATOMIC_SHIFTS)
+            {
+                output_freq_sh = atoi(env);
+                f_sh = fopen("qm_dftb_atomic_shifts.xvg", "a");
+                printf("The QM atomic shifts will be saved in file qm_dftb_atomic_shifts.xvg every %d steps.\n", output_freq_sh);
+            }
+            else
+            {
+                printf("NOTE: GMX_DFTB_ATOMIC_SHIFTS is ignored: the linked DFTB+ does not provide "
+                       "dftbp_get_atomic_shifts() in its C API.\n");
+            }
         }
 
         if (qm->qmmm_variant_get() != eqmmmVACUO && (env = getenv("GMX_DFTB_ESP")) != nullptr)
@@ -485,7 +523,9 @@ real call_dftbplus(QMMM_rec*         qr,
     dftbp_get_gross_charges(qm->dpcalc, q);
  // for (int i=0; i<n; i++)
  //     printf("%d %6.3f\n", i+1, q[i]);
+#if GMX_QMMM_DFTBPLUS_ATOMIC_SHIFTS
     dftbp_get_atomic_shifts(qm->dpcalc, atomicShifts);
+#endif
     dftbp_get_gradients(qm->dpcalc, grad);
     wallcycle_stop(wcycle, WallCycleCounter::QM);
 
@@ -655,6 +695,7 @@ real call_dftbplus(QMMM_rec*         qr,
     sfree(pot);
     sfree(potgrad);
     sfree(q);
+    sfree(atomicShifts);
     sfree(pot_sr);
     sfree(pot_lr);
 

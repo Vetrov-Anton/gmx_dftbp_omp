@@ -467,6 +467,12 @@ gmx_manage_colvars()
 target_link_libraries(libgromacs PRIVATE colvars)
 target_link_libraries(libgromacs PRIVATE plumedgmx)
 
+# DFTB+ for the QM/MM interface, see cmake/gmxManageDftbPlus.cmake
+if (GMX_QMMM_DFTBPLUS)
+    target_include_directories(libgromacs SYSTEM PRIVATE ${GMX_DFTBPLUS_INCLUDE_DIR})
+    target_link_libraries(libgromacs PRIVATE DftbPlus::DftbPlus)
+endif()
+
 # Make sure we fix "everything" found by compilers that support that
 gmx_warn_on_everything(libgromacs)
 if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")

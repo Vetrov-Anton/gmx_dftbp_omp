@@ -903,6 +903,8 @@ elseif(${GMX_QMMM_PROGRAM} STREQUAL "ORCA")
     set(GMX_QMMM_ORCA 1)
 elseif(${GMX_QMMM_PROGRAM} STREQUAL "DFTBPLUS")
     set(GMX_QMMM_DFTBPLUS 1)
+    include(gmxManageDftbPlus)
+    gmx_manage_dftbplus()
 elseif(${GMX_QMMM_PROGRAM} STREQUAL "NONE")
     # nothing to do
 else()

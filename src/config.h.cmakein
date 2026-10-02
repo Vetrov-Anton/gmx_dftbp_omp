@@ -223,6 +223,12 @@
 /* Use DFTB+ for QM-MM calculations */
 #cmakedefine01 GMX_QMMM_DFTBPLUS
 
+/* The DFTB+ C API takes the QM atoms and species from GROMACS (dftbp_process_input with an atom list) */
+#cmakedefine01 GMX_QMMM_DFTBPLUS_ATOM_LIST
+
+/* The DFTB+ C API provides dftbp_get_atomic_shifts() */
+#cmakedefine01 GMX_QMMM_DFTBPLUS_ATOMIC_SHIFTS
+
 /* Use sub-counters */
 #cmakedefine01 GMX_CYCLE_SUBCOUNTERS
 
