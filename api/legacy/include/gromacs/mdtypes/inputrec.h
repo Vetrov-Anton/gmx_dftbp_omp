@@ -98,17 +98,17 @@ struct t_grpopts
     //! Number of QM groups
     int ngQM = 0;
     //! Level of theory in the QM calculation
-    QMmethodType* QMmethod;
+    QMmethodType* QMmethod = nullptr;
     //! Basisset in the QM calculation
-    QMbasisType* QMbasis;
+    QMbasisType* QMbasis = nullptr;
     //! Total charge in the QM region
-    int* QMcharge;
+    int* QMcharge = nullptr;
     //! Spin multiplicity in the QM region
-    int* QMmult;
+    int* QMmult = nullptr;
     //! Number of orbitals in the active space
-    int* CASorbitals;
+    int* CASorbitals = nullptr;
     //! Number of electrons in the active space
-    int* CASelectrons;
+    int* CASelectrons = nullptr;
 };
 
 struct t_simtemp
@@ -648,7 +648,7 @@ struct t_inputrec // NOLINT (clang-analyzer-optin.performance.Padding)
     //! QM/MM calculation
     bool bQMMM = false;
     //! Factor for scaling the MM charges in QM calc.
-    real scalefactor;
+    real scalefactor = 1.0;
 
     /* Fields for removed features go here (better caching) */
     //! Whether AdResS is enabled - always false if a valid .tpr was read
