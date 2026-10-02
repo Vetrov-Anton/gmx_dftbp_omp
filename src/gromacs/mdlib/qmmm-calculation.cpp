@@ -676,6 +676,34 @@ void QMMM_rec::calculate_complete_QM_QM(//const t_commrec*  cr,
  ***  GRADIENTS       *************
  **********************************/
 
+/* Periodic image of x nearest to the reference position ref (rectangular box, as
+ * everywhere in this file). */
+static void qmmmNearestImage(const matrix box, const rvec ref, const rvec x, rvec image)
+{
+    for (int d = 0; d < DIM; d++)
+    {
+        const real L  = box[d][d];
+        real       dx = x[d] - ref[d];
+        if (L > 0)
+        {
+            dx -= L * std::round(dx / L);
+        }
+        image[d] = ref[d] + dx;
+    }
+}
+
+/* w += x (x) f */
+static void qmmmAddOuter(matrix w, const rvec x, const rvec f)
+{
+    for (int a = 0; a < DIM; a++)
+    {
+        for (int b = 0; b < DIM; b++)
+        {
+            w[a][b] += x[a] * f[b];
+        }
+    }
+}
+
 void QMMM_rec::gradient_QM_MM(//const t_commrec*  cr,
                               t_nrnb*           nrnb,
                               gmx_wallcycle*    wcycle,
@@ -877,10 +905,50 @@ void QMMM_rec::gradient_QM_MM(//const t_commrec*  cr,
       stepWork.computeForces = true;
       std::vector<real> emptyVec;
       gmx::ArrayRef<real> emptyArray;
+      /* The exact reciprocal-space virial, when this step needs one: the virial of the grid
+       * energy of all of the charges here, minus that of the MM charges alone (below), is the
+       * virial of the reciprocal-space QM--MM and QM--QM-image energy. It replaces the single
+       * sum x (x) F of the reciprocal-space forces, which is not the virial of an Ewald sum.
+       */
+      const bool wantVirial = computeVirial;
+      matrix recipVirAll, recipVirMM, recipSingleSum;
+      clear_mat(recipVirAll);
+      clear_mat(recipVirMM);
+      clear_mat(recipSingleSum);
+      real recipEnergy = 0, recipDvdl = 0;
+      stepWork.computeVirial = wantVirial;
+      stepWork.computeEnergy = wantVirial;
       gmx_pme_do(pmedata, pme_full.x, pme_full.f, pme_full.q, pme_full.q,
                  emptyArray, emptyArray, emptyArray, emptyArray, qm_.box, 0, 0, nrnb, // pme_full.nrnb->get(),
-                 wcycle, pme_full.vir, pme_full.vir, nullptr, nullptr, 0., 0., nullptr, nullptr,
+                 wcycle, recipVirAll, recipVirAll, &recipEnergy, &recipEnergy, 0., 0., &recipDvdl, &recipDvdl,
                  stepWork, TRUE, FALSE, n, nullptr); // emptyVec);
+      stepWork.computeVirial = false;
+      stepWork.computeEnergy = false;
+      if (wantVirial)
+      {
+        rvec image;
+        for (int j=0; j<n; j++)
+        {
+          qmmmNearestImage(qm_.box, qm_.xQM[0], qm_.xQM[j], image);
+          qmmmAddOuter(recipSingleSum, image, pme_full.f[j]);
+        }
+        // the grid virial of the MM charges alone, which is not part of the QM/MM energy
+        for (int j=0; j<n; j++)
+        {
+          pme_full.q[j] = 0.;
+        }
+        gmx::StepWorkload stepWorkMM;
+        stepWorkMM.computeVirial = true;
+        stepWorkMM.computeEnergy = true;
+        gmx_pme_do(pmedata, pme_full.x, pme_full.f, pme_full.q, pme_full.q,
+                   emptyArray, emptyArray, emptyArray, emptyArray, qm_.box, 0, 0, nrnb,
+                   wcycle, recipVirMM, recipVirMM, &recipEnergy, &recipEnergy, 0., 0., &recipDvdl, &recipDvdl,
+                   stepWorkMM, TRUE, FALSE, n, nullptr);
+        for (int j=0; j<n; j++)
+        {
+          pme_full.q[j] = qm_.QMcharges[j];
+        }
+      }
     //clock_gettime(CLOCK_MONOTONIC, &time2);
     //print_time_difference("PMETIME 3 ", time1, time2);
       for (int j=0; j<n; j++)
@@ -960,6 +1028,11 @@ void QMMM_rec::gradient_QM_MM(//const t_commrec*  cr,
         {
           grad_add[j][m] = - pme_qmonly.f[j][m] / gmx::c_hartreeBohr2Md * (mm_.scalefactor - 1.);
         }
+        /* This reciprocal-space part used to be overwritten below without ever reaching
+         * partgrad. It vanishes for scalefactor == 1, so only a run with
+         * MMChargeScaleFactor != 1 was affected.
+         */
+        rvec_inc(partgrad[j], grad_add[j]);
       }
    // printf("================================\n");
    // for (int i=0; i<n; i++)
@@ -1034,6 +1107,27 @@ void QMMM_rec::gradient_QM_MM(//const t_commrec*  cr,
           MMgrad_full[j][YY] = - qmmmChargesFull[j] * pme_full.f[n + j][YY] / gmx::c_hartreeBohr2Md;
           MMgrad_full[j][ZZ] = - qmmmChargesFull[j] * pme_full.f[n + j][ZZ] / gmx::c_hartreeBohr2Md;
       } // svmul(- mm_.MMcharges_full[j] / gmx::c_hartreeBohr2Md, pme->f[n + j], mm_.grad_full[j]);
+
+      if (wantVirial)
+      {
+        rvec image, force;
+        for (int j=0; j<ne_full; j++)
+        {
+          qmmmNearestImage(qm_.box, qm_.xQM[0], mm_.xMM_full[j], image);
+          svmul(qmmmChargesFull[j], pme_full.f[n + j], force);
+          qmmmAddOuter(recipSingleSum, image, force);
+        }
+        /* what calculate_QMMM() has to add on top of its single sum:
+         *   (exact reciprocal virial) - (the single sum of the reciprocal forces) */
+        for (int a=0; a<DIM; a++)
+        {
+          for (int b=0; b<DIM; b++)
+          {
+            recipVirialCorrection[a][b] = recipVirAll[a][b] - recipVirMM[a][b]
+                                          + 0.5 * recipSingleSum[a][b];
+          }
+        }
+      }
    // printf("================================\n");
    // for (int i=0; i<ne_full; i++)
    // {

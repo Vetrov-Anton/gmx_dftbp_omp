@@ -564,6 +564,23 @@ real call_dftbplus(QMMM_rec*         qr,
         snew(MMgrad_full, mm.nrMMatoms_full);
     }
 
+    /* The interaction of the QM charges with their own periodic images (PME).
+     * The callback hands DFTB+ the image potential V_img in every SCC iteration, and DFTB+
+     *   counts q.V_img in its energy in full. The Ewald energy of a charge distribution with
+     *   its own images is 1/2 q.V_img -- the other half would count every image pair twice --
+     *   and the image forces of gradient_QM_MM() (and the virial) are those of the halved
+     *   term. The energy is brought in line with them here.
+     */
+    if (qm->qmmm_variant_get() == eqmmmPME)
+    {
+        double eImage = 0.;
+        for (int i=0; i<n; i++)
+        {
+            eImage += q[i] * qm->pot_qmqm_get(i) / HARTREE_TO_EV;
+        }
+        QMener -= 0.5 * eImage;
+    }
+
     rvec *partgrad;
     snew(partgrad, qm->nrQMatoms_get());
     qr->gradient_QM_MM(nrnb, wcycle, // cr ... (qm->qmmm_variant_get() == eqmmmPME ? *qr->pmedata : nullptr),

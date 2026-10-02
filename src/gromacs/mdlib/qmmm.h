@@ -349,6 +349,15 @@ public:
     void update_QMMM_boundary_SR();
     // Fill qmmmChargesFull for the full MM list.
     void update_QMMM_boundary_full();
+
+    // Virial of the QM/MM forces. These forces are collected in a buffer of their own (the
+    //   run is marked as having direct virial contributions in init_forcerec()), so their
+    //   virial is supplied by calculate_QMMM() rather than by the single sum over the shift
+    //   forces. computeVirial says whether this step needs it, and recipVirialCorrection
+    //   holds what replaces the single sum x (x) F of the reciprocal-space PME forces by the
+    //   exact reciprocal-space virial; gradient_QM_MM() fills it.
+    bool   computeVirial         = false;
+    matrix recipVirialCorrection = { { 0 } };
     // Position of a fictitious point charge, from the short-range coordinates of MM1 and MM2.
     void boundary_point_position(const PotPoint& p, rvec x) const;
     // Potential of the fictitious point charges on the QM atoms, in e/nm.

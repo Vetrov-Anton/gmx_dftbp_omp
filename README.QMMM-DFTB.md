@@ -160,3 +160,30 @@ charges to `qmmm_exclusion_report.txt` (`GMX_QMMM_EXCLUSION_REPORT`, `GMX_QMMM_R
 | `4` | shifted cut-off |
 
 All boundary charge schemes work with every variant.
+
+### Periodic images of the QM charges (PME)
+
+With `GMX_QMMM_VARIANT=1`, DFTB+ receives the potential of the periodic images of the QM
+charges through a callback in every SCC iteration and counts `Σ_A q_A V_img(A)` in its energy
+in full, while the Ewald energy of a charge distribution with its own images is
+`½ Σ_A q_A V_img(A)` — and the image forces are those of the halved term. mdrun subtracts the
+other half from the energy of DFTB+.
+
+### Virial
+
+The QM/MM forces are collected in a buffer of their own, so their virial is supplied by the
+QM/MM code: every force is paired with the position it was computed from (the periodic image
+nearest to the first QM atom), which is exact for everything computed in real space, the
+forces of the fictitious boundary charges included; the reciprocal-space part of PME is
+replaced by the exact virial of the grid energy (QM and MM charges together, minus the MM
+charges alone). Before, the QM/MM forces were missing from the virial altogether. The extra
+work is one more PME call on the steps where the virial is needed. Rectangular boxes only.
+
+### Verification
+
+Central finite differences of the total potential energy against the forces of the same
+run (solvated cysteine with one link atom, `SCCTolerance = 1e-10`): with every scheme and
+every variant, |F + dE/dx| ≤ 0.025 kJ mol⁻¹ nm⁻¹ for MM1, MM2, QM1 and their neighbours.
+The virial, as `dU/dε = 2 tr(Ξ)` under isotropic scaling of all coordinates and of the box
+(flexible water): agreement to 0.1 of 7.8·10⁴ kJ/mol with PME and with reaction field;
+the previous code missed 270–280 kJ/mol there, about 75 bar on that box.

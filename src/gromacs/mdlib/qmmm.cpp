@@ -1673,6 +1673,8 @@ real QMMM_rec::calculate_QMMM(// const t_commrec*      cr,
      // snew(fshift, (qm_.nrQMatoms + mm_.nrMMatoms));
     }
 
+    computeVirial = forceWithVirial->computeVirial_;
+    clear_mat(recipVirialCorrection);
     QMener = call_QMroutine(this, qm_, mm_, forces, fshift, nrnb, wcycle); // (cr,)
 
     if (GMX_QMMM_DFTBPLUS)
@@ -1727,6 +1729,65 @@ real QMMM_rec::calculate_QMMM(// const t_commrec*      cr,
              // fshiftMM[globalToLocalAtomMap[mm_->shiftMM[i]]][j] += fshift[qm_->nrQMatoms+i][j];
             }
         }
+    }
+
+    /* Virial of the QM/MM forces. They are collected in a buffer of their own (see
+     * init_forcerec(), which marks a QM/MM run as having direct virial contributions), so the
+     * single sum over the shift forces does not see them and the virial is supplied here.
+     * Every force is paired with the position it was computed from: the QM and MM atoms are
+     * taken as the periodic images nearest to the first QM atom, which is what the
+     * minimum-image QM--MM terms and the contiguous QM cluster of DFTB+ use. That is exact for
+     * everything computed in real space, the forces of the fictitious charges of the boundary
+     * scheme included (they are linear in the positions of MM1 and MM2); the reciprocal-space
+     * part of PME is replaced by its exact virial, which gradient_QM_MM() has prepared.
+     * Rectangular boxes only, like the rest of this interface.
+     */
+    if (GMX_QMMM_DFTBPLUS && forceWithVirial->computeVirial_)
+    {
+        const auto nearestImage = [qm_](const rvec x, rvec image) {
+            for (int d = 0; d < DIM; d++)
+            {
+                const real L  = qm_->box[d][d];
+                real       dx = x[d] - qm_->xQM[0][d];
+                if (L > 0)
+                {
+                    dx -= L * std::round(dx / L);
+                }
+                image[d] = qm_->xQM[0][d] + dx;
+            }
+        };
+        const auto addTerm = [](matrix w, const rvec x, const rvec gradient) {
+            // the force is minus the stored gradient
+            for (int a = 0; a < DIM; a++)
+            {
+                for (int b = 0; b < DIM; b++)
+                {
+                    w[a][b] -= x[a] * gradient[b];
+                }
+            }
+        };
+        matrix w;
+        clear_mat(w);
+        rvec   image;
+        for (int i = 0; i < qm_->nrQMatoms; i++)
+        {
+            nearestImage(qm_->xQM[i], image);
+            addTerm(w, image, forces[i]);
+        }
+        for (int i = 0; i < mm_->nrMMatoms; i++)
+        {
+            nearestImage(mm_->xMM[i].as_vec(), image);
+            addTerm(w, image, forces[qm_->nrQMatoms + i]);
+        }
+        for (int i = 0; i < mm_->nrMMatoms_full; i++)
+        {
+            nearestImage(mm_->xMM_full[i].as_vec(), image);
+            addTerm(w, image, forces[qm_->nrQMatoms + mm_->nrMMatoms + i]);
+        }
+        matrix virial;
+        msmul(w, -0.5, virial);
+        m_add(virial, recipVirialCorrection, virial);
+        forceWithVirial->addVirialContribution(virial);
     }
 
     sfree(forces);

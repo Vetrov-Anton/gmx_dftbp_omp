@@ -916,8 +916,11 @@ void init_forcerec(FILE*                            fplog,
             || gmx_mtop_ftype_count(mtop, InteractionFunction::PositionRestraints) > 0
             || gmx_mtop_ftype_count(mtop, InteractionFunction::FlatBottomedPositionRestraints) > 0
             || inputrec.nwall > 0 || inputrec.bPull || inputrec.bRot || inputrec.bIMD;
+    // The QM/MM forces are computed together with the long-range electrostatics and
+    //   provide their own virial, see QMMM_rec::calculate_QMMM().
     const bool haveDirectVirialContributionsSlow = usingFullElectrostatics(interactionConst->coulomb.type)
-                                                   || usingLJPme(interactionConst->vdw.type);
+                                                   || usingLJPme(interactionConst->vdw.type)
+                                                   || inputrec.bQMMM;
     for (int i = 0; i < (simulationWork.useMts ? 2 : 1); i++)
     {
         bool haveDirectVirialContributions =
