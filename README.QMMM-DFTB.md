@@ -225,3 +225,58 @@ atom number (1-based) and its electrostatic gradient, the forces of the fictitio
 charges included. Units are hartree/bohr; these are gradients, the force is their negative
 (multiply by 4.96147·10⁴ for kJ mol⁻¹ nm⁻¹). An MM atom of the short-range list with PME
 appears in both gradient files, and its gradient is the sum of the two entries.
+
+## Parallel runs: one MPI rank, OpenMP threads
+
+The QM/MM interface runs on **one MPI rank** (no domain decomposition), which is also what
+PLUMED needs. All of the parallelism is OpenMP within that rank, in one thread pool:
+
+| part | threads |
+|---|---|
+| MM forces (nonbonded, bonded, update) | `-ntomp`, as in plain GROMACS |
+| PME of the MM system, and the QM/MM PME calls (potential of the MM charges on the QM atoms, potential of the periodic QM images in every SCC iteration, reciprocal-space gradients) | PME threads (`-ntomp`, or `-ntomp_pme`) |
+| QM–MM real-space potential and gradients, boundary charge schemes, Ewald exclusion terms, search of the MM atoms near the QM zone, forces and virial | `-ntomp` |
+| DFTB+ (SCC, forces) and its BLAS/LAPACK | `-ntomp`, or `GMX_QMMM_DFTB_NTHREADS` |
+
+Run, for example:
+
+```bash
+gmx mdrun -deffnm md -ntomp 8 -pin on -pinoffset 100 -pinstride 2 [-plumed plumed.dat]
+```
+
+- **Reproducibility.** The loops over the MM atoms are split into contiguous chunks; the
+  QM-atom sums of the threads are added in the order of the threads. With one thread the terms
+  are added in the order of the serial code. Different thread counts differ only by rounding
+  (≈10⁻⁹ kJ/mol on the potential energy of the test system).
+- **DFTB+ threads.** DFTB+ runs in the process of mdrun, on the threads of mdrun (by default
+  all `-ntomp` of them). `GMX_QMMM_DFTB_NTHREADS=N` sets another number. DFTB+ must not be
+  built with MPI (non-MPI DFTB+ uses OpenMP threads by default, `Parallel { UseOmpThreads }`).
+- **OpenBLAS.** Use the OpenMP build of OpenBLAS (Debian/Ubuntu: `libopenblas0-openmp`), so
+  that LAPACK runs on the same threads. mdrun reports at startup which one it found; with the
+  pthreads build it sets the number of OpenBLAS threads to that of DFTB+ and prints a NOTE,
+  since that pool is not pinned by mdrun.
+- **Pinning.** libgomp lets the surplus threads of its pool exit when a smaller team is
+  started (OpenBLAS does that for small matrices) and creates new threads later, which
+  inherit the affinity of the main thread. To keep them on the cores of mdrun, the main
+  thread of a QM/MM run gets the union of the cores of its pinned threads (printed as
+  `QM/MM threads: the main thread may run on the N cores ...`). Without that, the new threads
+  of a test run shared one core with the main thread and the step took 10× longer.
+- **PLUMED.** Runs on the same single rank. The native PLUMED interface of GROMACS 2026 does
+  not pass a thread count to PLUMED (`PLUMED_NUM_THREADS`, default 1); the PLUMED patch for
+  GROMACS 2026 does.
+- **Timing.** `GMX_QMMM_TIMING=N` prints every N steps the wall time per step of: the
+  potential of the MM atoms on the QM atoms, the DFTB+ calls (and the PME potential of the
+  QM images within them), the QM/MM gradients. The `QM` row of the cycle accounting in
+  `md.log` is the DFTB+ part.
+
+Measured on 12165 atoms (TIP3P box, flexible, PME), cores of one Threadripper 3990X,
+ms/step:
+
+| QM zone | 1 thread | 2 | 4 | 8 | of which at 8 threads: DFTB+ / QM–MM terms |
+|---|---|---|---|---|---|
+| 600 atoms (200 H₂O) | 10064 | 6309 | 4784 | 3987 | 3963 / 58 |
+| 150 atoms (50 H₂O) | 395 | 322 | 320 | 308 | 291 / 19 |
+
+The QM–MM terms scale 5–5.6× on 8 threads; the rest is DFTB+, ~87 % of it the
+diagonalisation (LAPACK), which scales 2.3–2.6× on 8 threads in a standalone DFTB+ run as
+well. A faster threaded LAPACK (e.g. MKL with the GNU OpenMP layer) speeds up exactly that part.

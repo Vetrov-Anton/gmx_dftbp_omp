@@ -45,6 +45,8 @@
 
 #if GMX_QMMM_DFTBPLUS
 
+#include <dlfcn.h>
+#include <chrono>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,13 +59,17 @@
 #include "gromacs/gmxlib/network.h"
 #include "gromacs/gmxlib/nrnb.h"
 #include "gromacs/math/units.h"
+#include "gromacs/mdlib/gmx_omp_nthreads.h"
 #include "gromacs/mdlib/qmmm.h"
+#include "gromacs/mdlib/qmmm_threading.h"
+#include "gromacs/mdtypes/commrec.h"
 #include "gromacs/mdtypes/forcerec.h"
 #include "gromacs/mdtypes/md_enums.h"
 #include "gromacs/pbcutil/pbc.h"
 #include "gromacs/timing/cyclecounter.h"
 #include "gromacs/timing/walltime_accounting.h"
 #include "gromacs/utility/fatalerror.h"
+#include "gromacs/utility/gmxomp.h"
 #include "gromacs/utility/smalloc.h"
 #include "gromacs/utility/vec.h"
 
@@ -138,6 +144,23 @@ void initialize_context(Context*          cont,
   return;
 }
 
+/* Wall-time breakdown of the QM/MM step, printed every GMX_QMMM_TIMING steps (in ms/step):
+ *   the potential of the MM atoms on the QM atoms (real space and PME), the DFTB+ calls with
+ *   the PME potential of the periodic QM images computed in the SCC iterations (callback),
+ *   and the QM/MM gradients.
+ */
+struct QmmmTiming
+{
+    using Clock = std::chrono::steady_clock;
+    double mmPotential = 0, dftb = 0, imageCallback = 0, gradient = 0;
+    int    numCallbacks = 0, numSteps = 0;
+    static double since(Clock::time_point t0)
+    {
+        return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    }
+};
+static QmmmTiming qmmmTiming;
+
 /* Calculate the external potential due to periodic images of QM atoms with PME.
  */
 void calcQMextPotPME(Context *cont, double *q, double *extpot)
@@ -149,6 +172,7 @@ void calcQMextPotPME(Context *cont, double *q, double *extpot)
 
   if (cont->pme)
   {
+      const auto t0 = QmmmTiming::Clock::now();
       /* PERFORM THE REAL CALCULATION */
       real *extpot_real;
       snew(extpot_real, n);
@@ -162,6 +186,8 @@ void calcQMextPotPME(Context *cont, double *q, double *extpot)
           extpot[i] = (double) - extpot_real[i]; // sign OK
       }
       sfree(extpot_real);
+      qmmmTiming.imageCallback += QmmmTiming::since(t0);
+      qmmmTiming.numCallbacks++;
   }
   else
   {
@@ -196,6 +222,94 @@ extern "C" void calcqmextpotgrad(void *refptr, gmx_unused double *q, double *ext
       extpotgrad[i] = 0.;
   return;
 }
+
+/* The OpenMP threads of DFTB+.
+ *   DFTB+ runs in the process of mdrun, in its OpenMP thread pool: by default on all of the
+ *   threads of mdrun (-ntomp), the threads that mdrun has pinned. GMX_QMMM_DFTB_NTHREADS
+ *   sets another number, e.g. fewer threads for a small QM zone.
+ */
+static int dftbNumThreads()
+{
+    static int numThreads = -1;
+    if (numThreads < 0)
+    {
+        numThreads = qmmm_omp::maxThreads();
+        if (const char* env = getenv("GMX_QMMM_DFTB_NTHREADS"))
+        {
+            const int value = atoi(env);
+            if (value > 0)
+            {
+                numThreads = value;
+            }
+            else
+            {
+                printf("NOTE: GMX_QMMM_DFTB_NTHREADS=%s is not a positive number; DFTB+ uses %d threads.\n",
+                       env, numThreads);
+            }
+        }
+    }
+    return numThreads;
+}
+
+/* The threading of the BLAS/LAPACK library of DFTB+, if it is OpenBLAS (looked up at run time,
+ *   so any BLAS works). OpenBLAS built on OpenMP shares the thread pool of mdrun and DFTB+;
+ *   the pthreads build has a pool of its own, whose threads are not pinned by mdrun. Its
+ *   number of threads is then set to that of DFTB+.
+ */
+static void setUpDftbBlasThreads(int numThreads)
+{
+    using GetInt    = int (*)();
+    using GetString = char* (*)();
+    using SetInt    = void (*)(int);
+    const auto getParallel = reinterpret_cast<GetInt>(dlsym(RTLD_DEFAULT, "openblas_get_parallel"));
+    const auto getConfig   = reinterpret_cast<GetString>(dlsym(RTLD_DEFAULT, "openblas_get_config"));
+    const auto setThreads  = reinterpret_cast<SetInt>(dlsym(RTLD_DEFAULT, "openblas_set_num_threads"));
+    if (getParallel == nullptr)
+    {
+        printf("QM/MM threads: the BLAS/LAPACK of DFTB+ is not OpenBLAS; its threading is not controlled by mdrun.\n");
+        return;
+    }
+    const int   mode     = getParallel(); // 0 sequential, 1 pthreads, 2 OpenMP
+    const char* modeName = mode == 0 ? "sequential" : (mode == 1 ? "pthreads" : "OpenMP");
+    printf("QM/MM threads: BLAS/LAPACK of DFTB+ is OpenBLAS (%s), %s.\n",
+           getConfig != nullptr ? getConfig() : "unknown version", modeName);
+    if (mode == 1)
+    {
+        if (setThreads != nullptr)
+        {
+            setThreads(numThreads);
+        }
+        printf("NOTE: OpenBLAS uses a pthreads pool of its own (%d threads), which mdrun does not pin.\n"
+               "      The OpenMP build of OpenBLAS (Debian/Ubuntu: libopenblas0-openmp) runs on the\n"
+               "      threads of mdrun instead and is recommended.\n",
+               numThreads);
+    }
+}
+
+/* Runs the DFTB+ calls of one MD step on numThreads OpenMP threads, and restores the number of
+ *   threads of mdrun afterwards (gmx_omp_nthreads_init() has set it as the default).
+ */
+class DftbThreadScope
+{
+public:
+    explicit DftbThreadScope(int numThreads) : previous_(gmx_omp_get_max_threads())
+    {
+        if (numThreads != previous_)
+        {
+            gmx_omp_set_num_threads(numThreads);
+        }
+    }
+    ~DftbThreadScope()
+    {
+        if (gmx_omp_get_max_threads() != previous_)
+        {
+            gmx_omp_set_num_threads(previous_);
+        }
+    }
+
+private:
+    int previous_;
+};
 
 /* DFTBPLUS interface routines */
 
@@ -248,7 +362,24 @@ void init_dftbplus(QMMM_QMrec*       qm,
 
     /* Fill up the context with all the relevant data! */
 
-    /* Initialize the DFTB+ calculator */
+    /* The layout of the parallel run: one MPI rank, OpenMP threads for everything. */
+    {
+        const int numThreadsDftb = dftbNumThreads();
+        printf("QM/MM threads: %d MPI rank(s); MM forces and the QM/MM electrostatics on %d OpenMP "
+               "thread(s), PME on %d, DFTB+ on %d.\n",
+               cr->commMySim.size(), qmmm_omp::maxThreads(),
+               gmx_omp_nthreads_get(ModuleMultiThread::Pme), numThreadsDftb);
+        if (numThreadsDftb > qmmm_omp::maxThreads())
+        {
+            printf("NOTE: DFTB+ uses more threads (%d) than mdrun (%d); the extra threads are not pinned.\n",
+                   numThreadsDftb, qmmm_omp::maxThreads());
+        }
+        setUpDftbBlasThreads(numThreadsDftb);
+        fflush(stdout);
+    }
+
+    /* Initialize the DFTB+ calculator, on the threads it will run on */
+    DftbThreadScope threadScope(dftbNumThreads());
     dftbp_init(&calculator, "dftb_in.out");
     printf("DFTB+ calculator has been created!\n");
     {
@@ -534,6 +665,7 @@ real call_dftbplus(QMMM_rec*         qr,
      * with PME, this will only include MM atoms,
      *    and the contribution from QM atoms will be added in every SCC iteration
      */
+    auto tStart = QmmmTiming::Clock::now();
     qr->calculate_SR_QM_MM(qm->qmmm_variant_get(), pot_sr);
     if (qm->qmmm_variant_get() == eqmmmPME)
     {
@@ -574,8 +706,12 @@ real call_dftbplus(QMMM_rec*         qr,
         q[i] = 0.;
     }
 
-    /* DFTB+ calculation itself */
+    qmmmTiming.mmPotential += QmmmTiming::since(tStart);
+    tStart = QmmmTiming::Clock::now();
+    /* DFTB+ calculation itself, on its OpenMP threads (dftbNumThreads()).
+     * The callback for the periodic QM images (PME) runs PME on the PME threads of mdrun. */
     wallcycle_start(wcycle, WallCycleCounter::QM);
+    DftbThreadScope threadScope(dftbNumThreads());
     dftbp_set_coords(qm->dpcalc, x); // unit OK
     dftbp_set_external_potential(qm->dpcalc, pot, potgrad); // unit and sign OK
     dftbp_get_energy(qm->dpcalc, &QMener); // unit OK
@@ -587,6 +723,7 @@ real call_dftbplus(QMMM_rec*         qr,
 #endif
     dftbp_get_gradients(qm->dpcalc, grad);
     wallcycle_stop(wcycle, WallCycleCounter::QM);
+    qmmmTiming.dftb += QmmmTiming::since(tStart);
 
     /* Save the gradient on the QM atoms */
     for (int i=0; i<n; i++)
@@ -654,8 +791,24 @@ real call_dftbplus(QMMM_rec*         qr,
 
     rvec *partgrad;
     snew(partgrad, qm->nrQMatoms_get());
+    tStart = QmmmTiming::Clock::now();
     qr->gradient_QM_MM(nrnb, wcycle, // cr ... (qm->qmmm_variant_get() == eqmmmPME ? *qr->pmedata : nullptr),
                    qm->qmmm_variant_get(), partgrad, MMgrad, MMgrad_full);
+    qmmmTiming.gradient += QmmmTiming::since(tStart);
+    qmmmTiming.numSteps++;
+    {
+        static const int timingStride = getenv("GMX_QMMM_TIMING") ? atoi(getenv("GMX_QMMM_TIMING")) : 0;
+        if (timingStride > 0 && qmmmTiming.numSteps % timingStride == 0)
+        {
+            const double ns = qmmmTiming.numSteps;
+            printf("QM/MM timing (ms/step, average of %d steps): MM potential %.2f, DFTB+ %.2f "
+                   "(of which QM-image PME %.2f in %.1f calls), gradients %.2f, %d MM atoms in the short-range list\n",
+                   qmmmTiming.numSteps, qmmmTiming.mmPotential / ns, qmmmTiming.dftb / ns,
+                   qmmmTiming.imageCallback / ns, qmmmTiming.numCallbacks / ns, qmmmTiming.gradient / ns,
+                   mm.nrMMatoms);
+            fflush(stdout);
+        }
+    }
 
     /* Optionally, write out the gradients while they are still separated.
      * At this point, and in atomic units (hartree/bohr):

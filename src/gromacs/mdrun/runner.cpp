@@ -109,6 +109,7 @@
 #include "gromacs/mdlib/force.h"
 #include "gromacs/mdlib/forcerec.h"
 #include "gromacs/mdlib/gmx_omp_nthreads.h"
+#include "gromacs/mdlib/qmmm_threading.h"
 #include "gromacs/mdlib/gpuforcereduction.h"
 #include "gromacs/mdlib/makeconstraints.h"
 #include "gromacs/mdlib/md_support.h"
@@ -2171,6 +2172,11 @@ int Mdrunner::mdrunner()
          * even with ThreadAffinity::Off */
         gmx_set_thread_affinity(
                 mdlog, cr->commMySim, physicalNodeComm, &hw_opt, *hwinfo_->hardwareTopology, numThreadsOnThisRank, nullptr);
+    }
+    if (fr != nullptr && fr->bQMMM && hw_opt.threadAffinity != ThreadAffinity::Off)
+    {
+        // DFTB+ and OpenBLAS create OpenMP threads after this point, see qmmmShareThreadAffinity()
+        qmmmShareThreadAffinity(gmx_omp_nthreads_get(ModuleMultiThread::Default));
     }
 
     if (EI_DYNAMICS(inputrec->eI))

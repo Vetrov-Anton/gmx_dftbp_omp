@@ -89,4 +89,24 @@ void gather_f_bsplines(const gmx_pme_t&          pme,
 real gather_energy_bsplines(const gmx_pme_t& pme, gmx::ArrayRef<const real> grid, const PmeAtomComm& atc,
                             int nrQMatoms, real *potential);
 
+/*! Interpolates the potential of the grid on the QM atoms (QM/MM), for one thread
+ *
+ * The QM atoms are the first \p nrQMatoms atoms of \p atc. Only the atoms of \p spline,
+ * i.e. of one OpenMP thread of PME, are handled, so the function is called by every thread
+ * with its own spline data. Supports OpenMP, not MPI parallelization.
+ *
+ * \param[in] pme        General PME settings
+ * \param[in] grid       The grid with potential values
+ * \param[in] atc        Contains the grid indices of the atoms
+ * \param[in] spline     The spline coefficients of the atoms of this thread
+ * \param[in] nrQMatoms  The number of QM atoms
+ * \param[out] potential The potential on the QM atoms of this thread
+ */
+void gather_potential_bsplines_qmmm(const gmx_pme_t&          pme,
+                                    gmx::ArrayRef<const real> grid,
+                                    const PmeAtomComm&        atc,
+                                    const splinedata_t&       spline,
+                                    int                       nrQMatoms,
+                                    real*                     potential);
+
 #endif

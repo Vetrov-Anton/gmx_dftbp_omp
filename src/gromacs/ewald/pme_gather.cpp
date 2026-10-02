@@ -324,9 +324,18 @@ void gather_f_bsplines(const gmx_pme_t&          pme,
     /* Note that unrolling this loop by templating this function on order
      * deteriorates performance significantly with gcc5/6/7.
      */
-    for (int nn = 0; nn < spline.n && (!bForQMMM || nn < nrQMatoms || bMMforcesOnly); nn++)
+    /* QM/MM: unless all forces are wanted (bMMforcesOnly), only those on the QM atoms,
+     * which are the first nrQMatoms atoms. With several threads, spline.ind holds the atoms
+     * of this thread in the order of the grid, so the QM atoms are picked by their index.
+     */
+    const bool onlyQMatoms = bForQMMM && !bMMforcesOnly;
+    for (int nn = 0; nn < spline.n; nn++)
     {
-        const int  n           = spline.ind[nn];
+        const int n = spline.ind[nn];
+        if (onlyQMatoms && n >= nrQMatoms)
+        {
+            continue;
+        }
         const real coefficient = scaleFactor * atc->coefficient[n];
 
         if (clearForces)
@@ -427,4 +436,59 @@ real gather_energy_bsplines(const gmx_pme_t& pme, gmx::ArrayRef<const real> grid
     }
 
     return energy;
+}
+void gather_potential_bsplines_qmmm(const gmx_pme_t&          pme,
+                                    gmx::ArrayRef<const real> grid,
+                                    const PmeAtomComm&        atc,
+                                    const splinedata_t&       spline,
+                                    int                       nrQMatoms,
+                                    real*                     potential)
+{
+    GMX_RELEASE_ASSERT(pme.nnodes == 1, "MPI parallelization is not supported here");
+
+    const int                order   = pme.pme_order;
+    const real* gmx_restrict gridPtr = grid.data();
+
+    /* The spline coefficients are stored by the position nn in the atom list of the thread,
+     * the grid indices by the atom index n. Every atom belongs to exactly one thread, so the
+     * threads write disjoint elements of potential[].
+     */
+    for (int nn = 0; nn < spline.n; nn++)
+    {
+        const int n = spline.ind[nn];
+        if (n >= nrQMatoms)
+        {
+            continue;
+        }
+        const int* idxptr = atc.idx[n];
+        const int  norder = nn * order;
+
+        const int i0 = idxptr[XX];
+        const int j0 = idxptr[YY];
+        const int k0 = idxptr[ZZ];
+
+        /* Pointer arithmetic alert, next three statements */
+        const real* thx = spline.theta.coefficients[XX] + norder;
+        const real* thy = spline.theta.coefficients[YY] + norder;
+        const real* thz = spline.theta.coefficients[ZZ] + norder;
+
+        real pot = 0;
+        for (int ithx = 0; ithx < order; ithx++)
+        {
+            const int  index_x = (i0 + ithx) * pme.pmegrid_ny * pme.pmegrid_nz;
+            const real tx      = thx[ithx];
+
+            for (int ithy = 0; ithy < order; ithy++)
+            {
+                const int  index_xy = index_x + (j0 + ithy) * pme.pmegrid_nz;
+                const real ty       = thy[ithy];
+
+                for (int ithz = 0; ithz < order; ithz++)
+                {
+                    pot += tx * ty * thz[ithz] * gridPtr[index_xy + (k0 + ithz)];
+                }
+            }
+        }
+        potential[n] = pot;
+    }
 }

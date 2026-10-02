@@ -47,8 +47,12 @@
 #include <cstring>
 
 #include <algorithm>
+#if defined(__linux__)
+#    include <sched.h>
+#endif
 #include <map>
 #include <string>
+#include <vector>
 
 #include "gromacs/domdec/domdec_struct.h"
 #include "gromacs/domdec/ga2la.h"
@@ -66,6 +70,7 @@
 #include "gromacs/mdlib/qm_gaussian.h"
 #include "gromacs/mdlib/qm_mopac.h"
 #include "gromacs/mdlib/qm_orca.h"
+#include "gromacs/mdlib/qmmm_threading.h"
 #include "gromacs/mdtypes/commrec.h"
 #include "gromacs/mdtypes/forceoutput.h"
 #include "gromacs/mdtypes/forcerec.h"
@@ -86,7 +91,9 @@
 #include "gromacs/topology/mtop_lookup.h"
 #include "gromacs/topology/mtop_util.h"
 #include "gromacs/topology/topology.h"
+#include "gromacs/utility/exceptions.h"
 #include "gromacs/utility/fatalerror.h"
+#include "gromacs/utility/gmxomp.h"
 #include "gromacs/utility/cstringutil.h"
 #include "gromacs/utility/smalloc.h"
 #include "gromacs/utility/stringutil.h"
@@ -182,8 +189,8 @@ void QMMM_rec::update_QMMM_coord(const t_commrec*  cr,
     QMMM_QMrec& qm_ = qm[0];
     QMMM_MMrec& mm_ = mm[0];
     real rcut = qm_.rcoulomb > 0.1 ? qm_.rcoulomb : 999999.; // infinity
-    std::vector<bool> isCurrentMMatom;
-    isCurrentMMatom.resize(mm_.nrMMatoms_nbl);
+    // char, not bool: the elements are written by several threads
+    std::vector<char> isCurrentMMatom(mm_.nrMMatoms_nbl, 0);
 
  // printf("Original Gromacs coordinates\n");
  // for (int i = 0; i < qm_.nrQMatoms; i++)
@@ -232,6 +239,7 @@ void QMMM_rec::update_QMMM_coord(const t_commrec*  cr,
     // find those that are within electrostatics cut-off.
     // For the cutoff, use the value "rcut"
     int nrMMatoms = 0;
+#pragma omp parallel for num_threads(qmmm_omp::numThreads(mm_.nrMMatoms_nbl, 256)) schedule(static) reduction(+ : nrMMatoms)
     for (int i = 0; i < mm_.nrMMatoms_nbl; i++)
     {
 	    isCurrentMMatom[i] = false;
@@ -291,6 +299,7 @@ void QMMM_rec::update_QMMM_coord(const t_commrec*  cr,
  //     printf("SHIFT %2d: %7.3f %7.3f %7.3f\n", a,
  //     fr->shift_vec[a][XX], fr->shift_vec[a][YY], fr->shift_vec[a][ZZ]);
 
+#pragma omp parallel for num_threads(qmmm_omp::numThreads(mm_.nrMMatoms, 1024)) schedule(static)
     for (int ind = 0; ind < mm_.nrMMatoms; ind++)
     {
         rvec_sub(x[globalToLocalAtomMap[mm_.indexMM[ind]]], shift_vec[mm_.shiftMM[ind]], mm_.xMM[ind]);
@@ -303,6 +312,7 @@ void QMMM_rec::update_QMMM_coord(const t_commrec*  cr,
     //   It might break the calculation of the surface correction in the Ewald sum.
     if (GMX_QMMM_DFTBPLUS)
     {
+#pragma omp parallel for num_threads(qmmm_omp::numThreads(mm_.nrMMatoms_full, 1024)) schedule(static)
         for (int i = 0; i < mm_.nrMMatoms_full; i++)
         {
             copy_rvec(x[globalToLocalAtomMap[mm_.indexMM_full[i]]], mm_.xMM_full[i]);
@@ -724,6 +734,55 @@ QMMM_rec::QMMM_rec(const t_commrec*                 cr,
 
 QMMM_rec::~QMMM_rec() = default;
 
+int qmmmShareThreadAffinity(int numThreads)
+{
+#if defined(__linux__)
+    if (numThreads <= 1)
+    {
+        return 0;
+    }
+    std::vector<cpu_set_t> masks(numThreads);
+    std::vector<int>       ok(numThreads, 0);
+#    pragma omp parallel num_threads(numThreads)
+    {
+        const int t = gmx_omp_get_thread_num();
+        CPU_ZERO(&masks[t]);
+        ok[t] = (sched_getaffinity(0, sizeof(cpu_set_t), &masks[t]) == 0);
+    }
+    cpu_set_t all;
+    CPU_ZERO(&all);
+    for (int t = 0; t < numThreads; t++)
+    {
+        if (!ok[t])
+        {
+            return 0;
+        }
+        CPU_OR(&all, &all, &masks[t]);
+    }
+    const int numCores = CPU_COUNT(&all);
+    if (numCores <= CPU_COUNT(&masks[0]) || sched_setaffinity(0, sizeof(cpu_set_t), &all) != 0)
+    {
+        return 0;
+    }
+    std::string list;
+    for (int c = 0; c < CPU_SETSIZE && gmx::ssize(list) < 200; c++)
+    {
+        if (CPU_ISSET(c, &all))
+        {
+            list += (list.empty() ? "" : ",") + std::to_string(c);
+        }
+    }
+    printf("QM/MM threads: the main thread may run on the %d cores of the %d pinned threads (%s),\n"
+           "  so that the OpenMP threads that DFTB+ and OpenBLAS create later stay on them.\n",
+           numCores, numThreads, list.c_str());
+    fflush(stdout);
+    return numCores;
+#else
+    (void) numThreads;
+    return 0;
+#endif
+}
+
 std::vector<int> qmmmAtomIndices(const t_inputrec& ir, const gmx_mtop_t& mtop)
 {
     const int               numQmmmGroups = ir.opts.ngQM;
@@ -791,6 +850,7 @@ void QMMM_rec::update_QMMMrec_dftb(const t_commrec*  cr,
     //   in a system treated with particle--mesh Ewald.
     rvec crd;
     rvec_sub(x[globalToLocalAtomMap[qm_.indexQM[0]]], shift_vec[qm_.shiftQM[0]], crd);
+#pragma omp parallel for num_threads(qmmm_omp::numThreads(mm_.nrMMatoms_full, 1024)) schedule(static)
     for (int i=0; i<mm_.nrMMatoms_full; i++) {
         rvec dx;
         mm_.shiftMM_full[i] = pbc_dx_aiuc(&pbc, crd, x[globalToLocalAtomMap[mm_.indexMM_full[i]]], dx);
@@ -807,6 +867,7 @@ void QMMM_rec::update_QMMMrec_dftb(const t_commrec*  cr,
  //     mm_.shiftMM[i] = is;
  // }
 
+#pragma omp parallel for num_threads(qmmm_omp::numThreads(mm_.nrMMatoms_full, 1024)) schedule(static)
     for (int i = 0; i < mm_.nrMMatoms_full; i++) // no free energy yet
     {
         mm_.MMcharges_full[i] = md->chargeA[globalToLocalAtomMap[mm_.indexMM_full[i]]] * mm_.scalefactor;
@@ -926,6 +987,7 @@ void QMMM_rec::update_QMMMrec_verlet_ns(const t_commrec*    cr,
                                         const t_mdatoms*    md,
                                         const matrix        box)
 {
+    (void) md;
  //  * COMMENTS TO THE FORMER GROUP-SCHEME BASED VERSION OF THIS FUNCTION:
  //  *********************************************************************
  //  * Create/update a number of QMMMrec entries:
@@ -976,96 +1038,111 @@ void QMMM_rec::update_QMMMrec_verlet_ns(const t_commrec*    cr,
  //     printf("VERLET QM SHIFT [%d] = %d\n", i, qm->shiftQM[i]);
  // }
 
-    // LOOP OVER THE nnbl NEIGHBORLISTS!
-    //   THIS IS NECESSARY WITH MULTITHREADING
-    for (int inbl=0; inbl<nnbl; inbl++)
+    /* The MM candidates are the non-QM atoms of the clusters that share a pair list entry
+     * with a cluster holding a QM atom. Each atom found gets the shift of its nearest QM atom.
+     *
+     * The search runs in two passes, both on the OpenMP threads of mdrun:
+     *   1. the pair lists (one per thread of the pair search) are scanned in parallel, and
+     *      the non-QM atoms of the clusters next to a QM cluster are collected per list;
+     *   2. the shifts of the atoms found are computed in parallel, atom by atom.
+     * The QM test is a table lookup, not a loop over the QM atoms. The result (atoms in
+     * the order of their global index, and their shifts) does not depend on the threads.
+     */
+    std::vector<char> isQMglobal(nAtoms, 0);
+    for (int q = 0; q < qm_.nrQMatoms; q++)
     {
-        // loop over CI clusters
-        for (unsigned ci=0; ci<nbl[inbl].ci.size(); ci++)
-	    {
-            // is there a QM atom in this CI cluster?
-	        bool qm_atom_in_ci = false;
-	        // break the loop if a QM atom has already been found
-            for (int ii=0; ii<nbl[inbl].na_ci && !qm_atom_in_ci; ii++)
+        isQMglobal[qm_.indexQM[q]] = 1;
+    }
+    const auto globalOf = [&](int localAtom) {
+        return localAtom < 0 ? -1 : localToGlobalAtomMap[localAtom];
+    };
+    const auto clusterHasQM = [&](int cluster, int na) {
+        for (int i = 0; i < na; i++)
+        {
+            const int g = globalOf(atomIndices[na * cluster + i]);
+            if (g >= 0 && isQMglobal[g])
             {
-                // compare to indices of QM atoms
-                for (int iq=0; iq<qm_.nrQMatoms && !qm_atom_in_ci; iq++)
+                return true;
+            }
+        }
+        return false;
+    };
+    std::vector<std::vector<int>> candidates(nnbl);
+#pragma omp parallel for num_threads(std::min(nnbl, qmmm_omp::maxThreads())) schedule(dynamic)
+    for (int inbl = 0; inbl < nnbl; inbl++)
+    {
+        try
+        {
+            const gmx::NbnxnPairlistCpu& list  = nbl[inbl];
+            std::vector<int>&            found = candidates[inbl];
+            const auto addCluster = [&](int cluster, int na) {
+                for (int i = 0; i < na; i++)
                 {
-                    const int localAtom = atomIndices[nbl[inbl].na_ci * nbl[inbl].ci[ci].ci + ii];
-                    if (localAtom < 0)
+                    const int g = globalOf(atomIndices[na * cluster + i]);
+                    if (g >= 0 && !isQMglobal[g])
                     {
-                        continue;
+                        found.push_back(g);
                     }
-                    //  FORMERLY:
-                    // const int iAtom  = nbs->a[nbl[inbl].na_ci * nbl[inbl].ci[ci].ci + ii];
-                    const int iAtom = localToGlobalAtomMap[localAtom];
-                    if (qm_.indexQM[iq] == iAtom)
+                }
+            };
+            // loop over CI clusters
+            for (const auto& ciEntry : list.ci)
+            {
+                const bool qmInCi = clusterHasQM(ciEntry.ci, list.na_ci);
+                // loop over the corresponding CJ clusters
+                for (int cj = ciEntry.cj_ind_start; cj < ciEntry.cj_ind_end; cj++)
+                {
+                    const int  cjCluster = list.cj.cj(cj);
+                    const bool qmInCj    = clusterHasQM(cjCluster, list.na_cj);
+                    // a QM atom in cluster CI: the non-QM atoms of cluster CJ are MM candidates
+                    if (qmInCi)
                     {
-                        qm_atom_in_ci = true;
+                        addCluster(cjCluster, list.na_cj);
+                    }
+                    // and vice versa
+                    if (qmInCj)
+                    {
+                        addCluster(ciEntry.ci, list.na_ci);
                     }
                 }
             }
-	        // get the shift of this CI cluster */
-	        // shift = nbl[inbl]->ci[ci].shift & NBNXN_CI_SHIFT;
-
-            // loop over the corresponding CJ clusters
-	        for (int cj = nbl[inbl].ci[ci].cj_ind_start; cj < nbl[inbl].ci[ci].cj_ind_end; cj++)
-	        {
-	            // is there a QM atom in this CJ cluster?
-	            bool qm_atom_in_cj = false;
-	            // break the loop if a QM atom has already been found
-                for (int jj=0; jj<nbl[inbl].na_cj && !qm_atom_in_cj; jj++)
-                {
-                    // compare to indices of QM atoms
-                    for (int jq=0; jq<qm_.nrQMatoms && !qm_atom_in_cj; jq++)
-                    {
-                        const int localAtom = atomIndices[nbl[inbl].na_cj * nbl[inbl].cj.cj(cj) + jj];
-                        if (localAtom < 0)
-                        {
-                            continue;
-                        }
-                        const int iAtom = localToGlobalAtomMap[localAtom];
-                        if (qm_.indexQM[jq] == iAtom)
-                        {
-                            qm_atom_in_cj = true;
-                        }
-                    }
-                }
-
-                // if there is a QM atom in cluster CI,
-		        //   then put the non-QM atoms in cluster CJ into the MM list
-	            if (qm_atom_in_ci)
-		        {
-	                put_cluster_in_MMlist_verlet(nbl[inbl].cj.cj(cj),
-                                                 nbl[inbl].na_cj,
-                                             // (nbl[inbl].cj[cj].cj ...
-                                                 qm_.nrQMatoms,
-                                                 qm_.indexQM,
-                                                 atomIndices,
-                                                 shiftMMatom.data(),
-                                                 &pbc,
-                                                 x,
-                                                 globalToLocalAtomMap,
-                                                 localToGlobalAtomMap);
-	            }
-
-                // if there is a QM atom in cluster CJ,
-		        //   then put the non-QM atoms in cluster CI into the MM list
-	            if (qm_atom_in_cj)
-		        {
-	                put_cluster_in_MMlist_verlet(nbl[inbl].ci[ci].ci,
-                                                 nbl[inbl].na_ci,
-                                                 qm_.nrQMatoms,
-                                                 qm_.indexQM,
-                                                 atomIndices,
-                                                 shiftMMatom.data(),
-                                                 &pbc,
-                                                 x,
-                                                 globalToLocalAtomMap,
-                                                 localToGlobalAtomMap);
-	            }
-	        }
-	    }
+        }
+        GMX_CATCH_ALL_AND_EXIT_WITH_FATAL_ERROR
+    }
+    std::vector<int> mmCandidates;
+    for (const std::vector<int>& found : candidates)
+    {
+        for (int g : found)
+        {
+            if (shiftMMatom[g] == -1)
+            {
+                shiftMMatom[g] = 0; // marked, the shift follows
+                mmCandidates.push_back(g);
+            }
+        }
+    }
+    // the shift that puts the MM atom next to its nearest QM atom
+    const int numCandidates = gmx::ssize(mmCandidates);
+#pragma omp parallel for num_threads(qmmm_omp::numThreads(numCandidates, 64)) schedule(static)
+    for (int c = 0; c < numCandidates; c++)
+    {
+        const int globalAtom = mmCandidates[c];
+        real      dist       = 1000.;
+        int       sh         = -1;
+        for (int q = 0; q < qm_.nrQMatoms; q++)
+        {
+            rvec bond;
+            const int sh_t = pbc_dx_aiuc(&pbc,
+                                         x[globalToLocalAtomMap[qm_.indexQM[q]]],
+                                         x[globalToLocalAtomMap[globalAtom]],
+                                         bond);
+            if (norm(bond) < dist)
+            {
+                dist = norm(bond);
+                sh   = sh_t;
+            }
+        }
+        shiftMMatom[globalAtom] = sh;
     }
 
     // count the MM atoms found in the above search
@@ -1688,6 +1765,8 @@ real QMMM_rec::calculate_QMMM(// const t_commrec*      cr,
             }
          // printf("F[%5d] = %8.2f %8.2f %8.2f\n", qm_->indexQM[i], forces[i][0], forces[i][1], forces[i][2]);
         }
+        // the MM atoms are distinct, so the threads write distinct forces
+#pragma omp parallel for num_threads(qmmm_omp::numThreads(mm_->nrMMatoms, 1024)) schedule(static)
         for (int i = 0; i < mm_->nrMMatoms; i++)
         {
             for (int j = 0; j < DIM; j++)
@@ -1699,6 +1778,7 @@ real QMMM_rec::calculate_QMMM(// const t_commrec*      cr,
          //   printf("F_MM[%5d] = %8.2f %8.2f %8.2f\n", mm_->indexMM[i],
          //     forces[qm_->nrQMatoms+i][0], forces[qm_->nrQMatoms+i][1], forces[qm_->nrQMatoms+i][2]);
         }
+#pragma omp parallel for num_threads(qmmm_omp::numThreads(mm_->nrMMatoms_full, 1024)) schedule(static)
         for (int i = 0; i < mm_->nrMMatoms_full; i++)
         {
             for (int j = 0; j < DIM; j++)
@@ -1779,10 +1859,30 @@ real QMMM_rec::calculate_QMMM(// const t_commrec*      cr,
             nearestImage(mm_->xMM[i].as_vec(), image);
             addTerm(w, image, forces[qm_->nrQMatoms + i]);
         }
-        for (int i = 0; i < mm_->nrMMatoms_full; i++)
         {
-            nearestImage(mm_->xMM_full[i].as_vec(), image);
-            addTerm(w, image, forces[qm_->nrQMatoms + mm_->nrMMatoms + i]);
+            // the long list of all MM atoms by thread, added in the order of the threads
+            struct VirialPart
+            {
+                matrix m;
+            };
+            const int               nrFull = mm_->nrMMatoms_full;
+            const int               nth    = qmmm_omp::numThreads(nrFull, 1024);
+            std::vector<VirialPart> wThread(nth);
+#pragma omp parallel for num_threads(nth) schedule(static)
+            for (int t = 0; t < nth; t++)
+            {
+                clear_mat(wThread[t].m);
+                rvec imageT;
+                for (int i = qmmm_omp::chunkStart(nrFull, t, nth); i < qmmm_omp::chunkStart(nrFull, t + 1, nth); i++)
+                {
+                    nearestImage(mm_->xMM_full[i].as_vec(), imageT);
+                    addTerm(wThread[t].m, imageT, forces[qm_->nrQMatoms + mm_->nrMMatoms + i]);
+                }
+            }
+            for (int t = 0; t < nth; t++)
+            {
+                m_add(w, wThread[t].m, w);
+            }
         }
         matrix virial;
         msmul(w, -0.5, virial);
