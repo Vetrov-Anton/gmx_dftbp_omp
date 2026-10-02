@@ -45,3 +45,53 @@ With a DFTB+ release the `Geometry` block of `dftb_in.hsd` must list the QM atom
 **in the order of the QM group** of the run. mdrun stops if the number of atoms
 differs. A `dftb_in.hsd` written for DFTB+ 21 needs one change for newer versions:
 `Analysis { CalculateForces = Yes }` becomes `Analysis { PrintForces = Yes }`.
+
+## Topology at the QM/MM boundary (grompp)
+
+The QM atoms are found from the `QMMM-grps` of the `.mdp`; their charges are set to
+zero and the force-field terms that the QM calculation describes are removed.
+Link atoms are QM virtual sites (`[ virtual_sites2 ]`) constructed from a QM atom
+(QM1) and an MM atom (MM1).
+
+### `GMX_QMMM_BONDED_SCHEME`
+
+| value | bonded terms removed |
+|---|---|
+| `classic` (default) | every term in which all but one atom are QM (a QM–QM–MM angle, a QM–QM–QM–MM dihedral), because the QM calculation with the link atom describes it |
+| `amber` | only terms whose atoms are all QM; every term with an MM atom is kept at the force-field level |
+
+Bonds between two QM atoms are converted to connections, so the connectivity (and the
+exclusions generated from it) stays complete. The scheme is stored in the `tpr`;
+mdrun only reminds you of that if it sees the variable.
+
+### `GMX_QMMM_LJ_SCHEME`
+
+| value | Lennard-Jones between QM and MM atoms |
+|---|---|
+| `forcefield` (default) | by the exclusion rules of the force field (`nrexcl`, `[ pairs ]`); only the LJ within the QM region is excluded |
+| `exclude` | in addition, the LJ and LJ-14 of every QM atom with the MM atoms bonded to the QM region are excluded (`classic` only; this was the behaviour of the code before the variable existed) |
+
+No LJ exclusions are generated for the link atoms; give them zero LJ parameters.
+
+### Restraints
+
+Position, flat-bottomed position, distance, orientation, angle and dihedral restraints
+and restraint potentials are never removed, also not on QM atoms.
+
+### Output
+
+grompp prints the schemes in use and a summary of the removed terms:
+
+```
+QM/MM: force-field terms removed with the 'classic' scheme, by interaction type:
+  interaction                all-QM     QM--MM    MM-only
+  Bond                            4          0          0
+  Angle                           4          3          0
+  Proper Dih.                     2          1          0
+  LJ-14                           2          0          0
+  total                          12          4          0
+```
+
+and writes every removed term, kept restraint, converted bond, removed pair and
+generated exclusion, atom by atom, to `qmmm_topology_report.txt` (name set with
+`GMX_QMMM_TOPOLOGY_REPORT`; `GMX_QMMM_REPORTS=off` switches the report files off).

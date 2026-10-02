@@ -931,8 +931,9 @@ enum class MdGraphEvenOrOddStep : int
 //! \brief QM/MM mode
 enum class QmmmModeType : int
 {
-    Original,
+    Original, //!< QM/MM with link atoms, "classic" treatment of the boundary terms
     MiMiC,
+    Amber, //!< QM/MM with link atoms, only all-QM bonded terms are removed
     Count,
     Default = Original
 };

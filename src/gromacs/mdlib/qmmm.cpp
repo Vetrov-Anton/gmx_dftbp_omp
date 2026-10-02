@@ -605,6 +605,17 @@ QMMM_rec::QMMM_rec(const t_commrec*                 cr,
     }
     else if (GMX_QMMM_DFTBPLUS)
     {
+        // The bonded and LJ interactions at the QM/MM boundary are treated according to
+        //   the schemes selected in grompp, and the outcome is stored in the tpr file.
+        if (getenv("GMX_QMMM_BONDED_SCHEME") != nullptr || getenv("GMX_QMMM_LJ_SCHEME") != nullptr)
+        {
+            fprintf(stdout,
+                    "NOTE: GMX_QMMM_BONDED_SCHEME and GMX_QMMM_LJ_SCHEME are evaluated by grompp, "
+                    "not by mdrun.\n"
+                    "      The treatment of the bonded and LJ interactions at the QM/MM boundary "
+                    "is fixed in the tpr file.\n");
+        }
+
         // Look how the QM/MM electrostatics shall be treated.
         // In the future, this could be performed for QM/MM in general,
         //   not only with DFTB+.
