@@ -95,3 +95,68 @@ QM/MM: force-field terms removed with the 'classic' scheme, by interaction type:
 and writes every removed term, kept restraint, converted bond, removed pair and
 generated exclusion, atom by atom, to `qmmm_topology_report.txt` (name set with
 `GMX_QMMM_TOPOLOGY_REPORT`; `GMX_QMMM_REPORTS=off` switches the report files off).
+
+## QM–MM electrostatics at the boundary (mdrun)
+
+### Atoms at the boundary
+
+| name | meaning |
+|---|---|
+| QM1 | QM atom covalently bonded to an MM atom |
+| MM1 | that MM atom; a link atom is constructed from QM1 and MM1 |
+| MM2 | MM atoms bonded to MM1 (not QM) |
+| LA | link atom: a virtual site of the QM group constructed from one QM and one MM atom |
+
+### `GMX_QMMM_POT_SCHEME`
+
+With a boundary charge scheme, the charge of every MM1 atom is removed from the QM–MM
+electrostatics of every QM atom and replaced as below; `q0 = q(MM1)/n`, with `n` the number
+of MM2 atoms of that MM1.
+
+| value | QM–MM electrostatics |
+|---|---|
+| `none` (default) | every MM charge in full |
+| `RC` | MM1 removed; `q0` at the midpoint of every MM1–MM2 bond (Lin & Truhlar 2005) |
+| `RCD` | MM1 removed; `2·q0` at every midpoint, and `q(MM2) − q0` on every MM2 (Lin & Truhlar 2005) |
+| `CS` | MM1 removed; `q(MM2) + q0` on every MM2, and a pair `+q0/0.12` / `−q0/0.12` on the MM1→MM2 line at 0.94 and 1.06 of the bond length (charge shift, Sherwood *et al.* 2003) |
+| `AMBER` | MM1 removed; the MM1 charges of a molecule spread evenly over all other MM atoms of the same molecule |
+
+**The same charges are used for the external potential passed to DFTB+ and for the QM/MM
+gradient**, so the forces are the gradient of the energy that DFTB+ returns. The
+redistribution exists only in the QM–MM electrostatics: the topology and every MM–MM
+interaction keep the charges of the force field.
+
+The fictitious charges have no coordinates of their own: a charge at
+`x = (1 − f)·x(MM1) + f·x(MM2)` is a two-atom virtual site, and the force on it is passed to
+MM1 and MM2 with the weights `1 − f` and `f`. With PME the fictitious charges act on the QM
+atoms with the full `1/r` (they are not on the grid), and the charge of MM1 is removed in the
+central cell — its reciprocal-space term is subtracted as a pair term `erf(βr)/r` — while its
+periodic images stay. With the cut-off variants the fictitious charges use the same kernel as
+the MM atoms. `AMBER` shares are added to the charges of the receiving atoms, on the
+short-range list and on the PME grid.
+
+mdrun stops with an error if an MM1 atom has no MM2 atom, if an MM2 atom is itself an MM1
+atom or is bonded to a QM atom, if one MM1 atom belongs to two link atoms, or if the molecule
+of an MM1 atom has no other MM atom (`AMBER`). It prints the scheme in use,
+
+```
+QM/MM electrostatics with the boundary charge scheme CS: 1 MM1 charges removed, 9 fictitious point charges added.
+  The external potential passed to DFTB+ and the QM/MM forces are built from the same charges;
+  the forces on the point charges are passed to their MM1 and MM2 atoms as for two-atom virtual sites.
+  The MM--MM interactions keep the charges of the topology.
+```
+
+and writes the link atoms, the removed MM1 charges, the `AMBER` shares and the fictitious
+charges to `qmmm_exclusion_report.txt` (`GMX_QMMM_EXCLUSION_REPORT`, `GMX_QMMM_REPORTS=off`).
+
+### `GMX_QMMM_VARIANT`
+
+| value | QM–MM electrostatics |
+|---|---|
+| `0` | none (vacuum QM) — the default when unset |
+| `1` | PME (requires a periodic system) |
+| `2` | switched cut-off |
+| `3` | reaction field |
+| `4` | shifted cut-off |
+
+All boundary charge schemes work with every variant.

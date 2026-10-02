@@ -292,6 +292,71 @@ public:
                                                    //   global atom 2 is local atom 1
     int                      nAtoms; // total number of atoms in the simulation (QM + MM)
 
+    // Treatment of the QM/MM boundary in the QM--MM electrostatics (GMX_QMMM_POT_SCHEME),
+    //   see init_QMMM_boundary(). With a boundary charge scheme, the charge of every MM1
+    //   atom (the MM atom a link atom is constructed from) is removed from the QM--MM
+    //   electrostatics and replaced by fictitious point charges near the MM1--MM2 bonds
+    //   (RC, RCD, CS) or spread over the other MM atoms of the molecule (AMBER).
+    // The external potential passed to DFTB+ and the QM/MM gradient are built from exactly
+    //   the same charges, so that the forces are the gradient of the energy. The topology,
+    //   and with it every MM--MM interaction, keeps the charges of the force field.
+    enum class PotScheme
+    {
+        None,  // every MM charge enters the QM--MM electrostatics in full
+        RC,    // redistributed charge: q(MM1)/n on the midpoints of the MM1-MM2 bonds
+        RCD,   // redistributed charge and dipole: 2q(MM1)/n there, q(MM2) - q(MM1)/n
+        CS,    // charge shift: q(MM2) + q(MM1)/n, and +-q(MM1)/(0.12 n) at 0.94 and 1.06 of MM1->MM2
+        Amber  // the MM1 charges spread evenly over the other MM atoms of their molecule
+    };
+    PotScheme potScheme = PotScheme::None;
+    // A link atom: a QM virtual site constructed from one QM atom (QM1) and one MM atom (MM1)
+    struct LinkAtom
+    {
+        int la;  // global index of the link atom
+        int qm1; // global index of its QM1 atom
+        int mm1; // global index of its MM1 atom
+    };
+    std::vector<LinkAtom> linkAtoms;
+    // A fictitious point charge q at x(a) + f * (x(b) - x(a)), a = MM1 and b = MM2 (global
+    //   indices). It has no coordinates of its own: as a two-atom virtual site, the force
+    //   on it is passed to MM1 and MM2 with the weights (1 - f) and f.
+    struct PotPoint
+    {
+        int  a;
+        int  b;
+        real f;
+        real q;
+    };
+    std::vector<PotPoint> potPoints;
+    // Global atom -> whether its charge is removed from the QM--MM electrostatics (MM1).
+    //   Empty without a boundary charge scheme.
+    std::vector<bool> isRemovedMM1;
+    // Global atom -> charge added to it in the QM--MM electrostatics (AMBER), before the
+    //   scalefactor. Empty with the other schemes.
+    std::vector<real> potChargeShift;
+    // The MM charges of the QM--MM electrostatics on the short-range list (topology charge
+    //   plus shift, incl. scalefactor; a removed MM1 keeps its charge here and gets the
+    //   factor 0 in qmmmScaleSR), and on the full list. Rebuilt with the lists.
+    std::vector<real> qmmmChargesSR;
+    std::vector<real> qmmmScaleSR;
+    std::vector<real> qmmmChargesFull;
+    // Global atom -> its position on the short-range MM list, or -1.
+    std::vector<int> localIndexOfAtom;
+
+    // Set up the boundary charge scheme; called once, from the constructor.
+    void init_QMMM_boundary(const gmx_mtop_t* mtop);
+    // Fill qmmmChargesSR, qmmmScaleSR and localIndexOfAtom for the current short-range list.
+    void update_QMMM_boundary_SR();
+    // Fill qmmmChargesFull for the full MM list.
+    void update_QMMM_boundary_full();
+    // Position of a fictitious point charge, from the short-range coordinates of MM1 and MM2.
+    void boundary_point_position(const PotPoint& p, rvec x) const;
+    // Potential of the fictitious point charges on the QM atoms, in e/nm.
+    void add_boundary_scheme_potential(int variant, real* pot);
+    // Their electrostatic gradient, in hartree/bohr: on the QM atoms (partgrad) and, by the
+    //   chain rule, on MM1 and MM2 (MMgrad, indices of the short-range list).
+    void add_boundary_scheme_gradient(int variant, rvec* partgrad, rvec* MMgrad);
+
     QMMM_rec(const t_commrec*                 cr,
              const gmx_mtop_t*                mtop,
              const t_inputrec*                ir,

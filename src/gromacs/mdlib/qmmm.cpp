@@ -47,6 +47,8 @@
 #include <cstring>
 
 #include <algorithm>
+#include <map>
+#include <string>
 
 #include "gromacs/domdec/domdec_struct.h"
 #include "gromacs/domdec/ga2la.h"
@@ -85,7 +87,9 @@
 #include "gromacs/topology/mtop_util.h"
 #include "gromacs/topology/topology.h"
 #include "gromacs/utility/fatalerror.h"
+#include "gromacs/utility/cstringutil.h"
 #include "gromacs/utility/smalloc.h"
+#include "gromacs/utility/stringutil.h"
 #include "gromacs/utility/vec.h"
 
 // When not built in a configuration with QMMM support, much of this
@@ -276,6 +280,10 @@ void QMMM_rec::update_QMMM_coord(const t_commrec*  cr,
 	        index++;
 	    }
     }
+
+    // The short-range MM list has just been rebuilt: map the charges of the QM--MM
+    //   electrostatics (boundary charge scheme) onto it.
+    update_QMMM_boundary_SR();
 
     // also shift the MM atoms into the central box
 
@@ -696,6 +704,9 @@ QMMM_rec::QMMM_rec(const t_commrec*                 cr,
         snew(qm[0].QMcharges, qm[0].nrQMatoms);
         snew(qm[0].QMatomicShifts, qm[0].nrQMatoms);
 
+        // Boundary charge scheme of the QM--MM electrostatics
+        init_QMMM_boundary(mtop);
+
         init_dftbplus(&(qm[0]), this, ir, cr); //, wcycle);
     }
     else
@@ -800,6 +811,7 @@ void QMMM_rec::update_QMMMrec_dftb(const t_commrec*  cr,
     {
         mm_.MMcharges_full[i] = md->chargeA[globalToLocalAtomMap[mm_.indexMM_full[i]]] * mm_.scalefactor;
     }
+    update_QMMM_boundary_full();
 } // update_QMMMrec_dftb
 
 // ADD THE NON-QM ATOMS IN THE VERLET CLUSTER ck TO THE LIST OF MM ATOMS
@@ -1092,6 +1104,537 @@ void QMMM_rec::update_QMMMrec_verlet_ns(const t_commrec*    cr,
 	    exit(-1);
     }
 } // update_QMMMrec_verlet_ns
+
+namespace
+{
+
+/*! \brief Whether the per-atom QM/MM report files are written.
+ *
+ * On by default; GMX_QMMM_REPORTS set to 0, no, off or false switches off the
+ * reports of both grompp and mdrun, together with the lines that point to them.
+ */
+bool qmmmReportsEnabled()
+{
+    const char* env = std::getenv("GMX_QMMM_REPORTS");
+    if (env == nullptr)
+    {
+        return true;
+    }
+    for (const char* off : { "0", "no", "off", "false" })
+    {
+        if (gmx_strcasecmp(env, off) == 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+//! Name of a boundary charge scheme, as set with GMX_QMMM_POT_SCHEME
+const char* potSchemeName(QMMM_rec::PotScheme scheme)
+{
+    switch (scheme)
+    {
+        case QMMM_rec::PotScheme::RC: return "RC";
+        case QMMM_rec::PotScheme::RCD: return "RCD";
+        case QMMM_rec::PotScheme::CS: return "CS";
+        case QMMM_rec::PotScheme::Amber: return "AMBER";
+        default: return "none";
+    }
+}
+
+//! "RESnr NAME" label of a global atom
+std::string qmmmGlobalAtomLabel(const gmx_mtop_t& mtop, int globalIndex)
+{
+    int         molb    = 0;
+    int         resnr   = 0;
+    const char* name    = nullptr;
+    const char* resname = nullptr;
+    mtopGetAtomAndResidueName(mtop, globalIndex, &molb, &name, &resnr, &resname, nullptr);
+    return gmx::formatString("%s%d %s", resname, resnr, name);
+}
+
+//! Writes, atom by atom, the boundary treatment of the QM--MM electrostatics
+void writeQmmmChargeReport(const gmx_mtop_t& mtop, const QMMM_rec& qr, const std::vector<bool>& bQM, const char* fileName)
+{
+    FILE* fp = std::fopen(fileName, "w");
+    if (fp == nullptr)
+    {
+        fprintf(stderr, "WARNING: could not open %s for the QM/MM charge report\n", fileName);
+        return;
+    }
+    std::vector<bool> isLA(bQM.size(), false);
+    for (const QMMM_rec::LinkAtom& l : qr.linkAtoms)
+    {
+        isLA[l.la] = true;
+    }
+    const auto atomText = [&](int a) {
+        return gmx::formatString("%7d %-14s %s", a + 1, qmmmGlobalAtomLabel(mtop, a).c_str(),
+                                 isLA[a] ? "LA" : (bQM[a] ? "QM" : "MM"));
+    };
+    const auto chargeOf = [&mtop](int a) {
+        int molb = 0;
+        return mtopGetAtomParameters(mtop, a, &molb).q;
+    };
+    const QMMM_QMrec& qm_ = qr.qm[0];
+
+    fprintf(fp, "; QM/MM electrostatics at the QM/MM boundary, written by gmx mdrun\n");
+    fprintf(fp, "; atom numbers are global and 1-based, i.e. the numbering of the input .gro file\n");
+    fprintf(fp, "; labels are RESIDUEnumber ATOMNAME from the topology; LA = link atom\n");
+    fprintf(fp, "; boundary charge scheme: GMX_QMMM_POT_SCHEME = %s\n", potSchemeName(qr.potScheme));
+    fprintf(fp, "; the external potential passed to DFTB+ and the QM/MM gradient use the same charges;\n");
+    fprintf(fp, ";   the MM--MM interactions keep the charges of the topology\n\n");
+
+    fprintf(fp, "[ qm_atoms ]\n; %d atoms, in the order of the QM group\n", qm_.nrQMatoms_get());
+    for (int a = 0; a < static_cast<int>(bQM.size()); a++)
+    {
+        if (bQM[a])
+        {
+            fprintf(fp, "%s\n", atomText(a).c_str());
+        }
+    }
+
+    fprintf(fp, "\n[ link_atoms ]\n; virtual sites of the QM group constructed from a QM1 and an MM1 atom: %zu\n",
+            qr.linkAtoms.size());
+    fprintf(fp, "; %-26s %-26s %s\n", "link atom", "QM1", "MM1");
+    for (const QMMM_rec::LinkAtom& l : qr.linkAtoms)
+    {
+        fprintf(fp, "%s %s %s\n", atomText(l.la).c_str(), atomText(l.qm1).c_str(), atomText(l.mm1).c_str());
+    }
+
+    fprintf(fp, "\n[ removed_mm1_charges ]\n");
+    if (qr.potScheme == QMMM_rec::PotScheme::None)
+    {
+        fprintf(fp, "; none: without a boundary charge scheme every MM charge enters the QM--MM electrostatics in full\n");
+    }
+    else
+    {
+        fprintf(fp, "; MM1 atoms whose charge is removed from the QM--MM electrostatics of every QM atom\n");
+        fprintf(fp, "; %-26s %10s\n", "MM1 atom", "q_MM1");
+        for (const QMMM_rec::LinkAtom& l : qr.linkAtoms)
+        {
+            fprintf(fp, "%s %+10.5f\n", atomText(l.mm1).c_str(), chargeOf(l.mm1));
+        }
+    }
+
+    fprintf(fp, "\n[ charge_shift ]\n");
+    if (qr.potScheme == QMMM_rec::PotScheme::Amber)
+    {
+        fprintf(fp, "; AMBER: the MM1 charges are spread over the other MM atoms of their molecule,\n");
+        fprintf(fp, ";   in the QM--MM electrostatics only; every atom that receives a share:\n");
+        fprintf(fp, "; %-26s %10s %14s\n", "MM atom", "q_MM", "added");
+        for (size_t a = 0; a < qr.potChargeShift.size(); a++)
+        {
+            if (qr.potChargeShift[a] != real(0.0))
+            {
+                fprintf(fp, "%s %+10.5f %+14.8e\n", atomText(static_cast<int>(a)).c_str(),
+                        chargeOf(static_cast<int>(a)), qr.potChargeShift[a]);
+            }
+        }
+    }
+    else
+    {
+        fprintf(fp, "; none\n");
+    }
+
+    fprintf(fp, "\n[ point_charges ]\n");
+    if (qr.potPoints.empty())
+    {
+        fprintf(fp, "; none\n");
+    }
+    else
+    {
+        fprintf(fp, "; fictitious charges at x(MM1) + f * (x(MM2) - x(MM1)), seen by the QM atoms only;\n");
+        fprintf(fp, ";   f = 1 is a change of the charge of MM2 itself. Their forces are passed to\n");
+        fprintf(fp, ";   MM1 and MM2 with the weights (1 - f) and f, as for a two-atom virtual site\n");
+        fprintf(fp, "; %-26s %-26s %6s %10s\n", "MM1 atom", "MM2 atom", "f", "charge");
+        for (const QMMM_rec::PotPoint& pt : qr.potPoints)
+        {
+            fprintf(fp, "%s %s %6.3f %+10.5f\n", atomText(pt.a).c_str(), atomText(pt.b).c_str(), pt.f, pt.q);
+        }
+    }
+    std::fclose(fp);
+}
+
+} // namespace
+
+// Set up the boundary charge scheme of the QM--MM electrostatics (GMX_QMMM_POT_SCHEME).
+//
+// With a scheme, the charge of every MM1 atom (the MM atom from which a link atom is
+// constructed) is removed from the QM--MM electrostatics of every QM atom, and replaced by
+// fictitious point charges near the MM1--MM2 bonds (Lin and Truhlar, J. Phys. Chem. A 109,
+// 3991 (2005) for RC and RCD; Sherwood et al., THEOCHEM 632, 1 (2003) for CS), or spread
+// evenly over the other MM atoms of the molecule (AMBER). The external potential of DFTB+ and
+// the QM/MM gradient use these same charges, so the forces stay the gradient of the energy.
+// The topology and the MM--MM interactions keep the charges of the force field.
+void QMMM_rec::init_QMMM_boundary(const gmx_mtop_t* mtop)
+{
+    QMMM_QMrec& qm_ = qm[0];
+
+    const char* env = getenv("GMX_QMMM_POT_SCHEME");
+    potScheme       = PotScheme::None;
+    if (env != nullptr)
+    {
+        if (gmx_strcasecmp(env, "none") == 0)
+        {
+            potScheme = PotScheme::None;
+        }
+        else if (gmx_strcasecmp(env, "RC") == 0)
+        {
+            potScheme = PotScheme::RC;
+        }
+        else if (gmx_strcasecmp(env, "RCD") == 0)
+        {
+            potScheme = PotScheme::RCD;
+        }
+        else if (gmx_strcasecmp(env, "CS") == 0)
+        {
+            potScheme = PotScheme::CS;
+        }
+        else if (gmx_strcasecmp(env, "AMBER") == 0)
+        {
+            potScheme = PotScheme::Amber;
+        }
+        else
+        {
+            gmx_fatal(FARGS, "GMX_QMMM_POT_SCHEME must be none, RC, RCD, CS or AMBER, but it is '%s'.", env);
+        }
+    }
+
+    const int         natoms = mtop->natoms;
+    std::vector<bool> bQM(natoms, false);
+    for (int j = 0; j < qm_.nrQMatoms; j++)
+    {
+        bQM[qm_.indexQM[j]] = true;
+    }
+
+    // Link atoms: QM virtual sites constructed from one QM and one MM atom.
+    linkAtoms.clear();
+    std::vector<bool> isLA(natoms, false);
+    int               atomOffset = 0;
+    for (const gmx_molblock_t& molb : mtop->molblock)
+    {
+        const gmx_moltype_t& molt = mtop->moltype[molb.type];
+        for (int mol = 0; mol < molb.nmol; mol++, atomOffset += molt.atoms.nr)
+        {
+            for (const auto ftype : gmx::EnumerationWrapper<InteractionFunction>{})
+            {
+                if (!IS_VSITE(ftype) || ftype == InteractionFunction::VirtualSiteN)
+                {
+                    continue;
+                }
+                const int              nral = NRAL(ftype);
+                const InteractionList& il   = molt.ilist[ftype];
+                for (int i = 0; i < il.size(); i += 1 + nral)
+                {
+                    const int site = atomOffset + il.iatoms[i + 1];
+                    if (!bQM[site])
+                    {
+                        continue;
+                    }
+                    std::vector<int> qmBuild, mmBuild;
+                    for (int c = 2; c <= nral; c++)
+                    {
+                        const int a = atomOffset + il.iatoms[i + c];
+                        (bQM[a] ? qmBuild : mmBuild).push_back(a);
+                    }
+                    if (mmBuild.empty())
+                    {
+                        continue; // a virtual site inside the QM region
+                    }
+                    if (qmBuild.size() != 1 || mmBuild.size() != 1)
+                    {
+                        gmx_fatal(FARGS,
+                                  "QM virtual site %d is constructed from MM atoms, but it is not a "
+                                  "link atom constructed from one QM and one MM atom.",
+                                  site + 1);
+                    }
+                    linkAtoms.push_back({ site, qmBuild[0], mmBuild[0] });
+                    isLA[site] = true;
+                }
+            }
+        }
+    }
+
+    // Chemical bonds of the entire system, in global atom numbering, without the link
+    //   atoms. The bonds inside the QM region are connections by now, which are chemical
+    //   bonds as well.
+    std::vector<std::vector<int>> bonds(natoms);
+    atomOffset = 0;
+    for (const gmx_molblock_t& molb : mtop->molblock)
+    {
+        const gmx_moltype_t& molt = mtop->moltype[molb.type];
+        for (int mol = 0; mol < molb.nmol; mol++, atomOffset += molt.atoms.nr)
+        {
+            for (const auto ftype : gmx::EnumerationWrapper<InteractionFunction>{})
+            {
+                if (!IS_CHEMBOND(ftype))
+                {
+                    continue;
+                }
+                const InteractionList& il = molt.ilist[ftype];
+                for (int i = 0; i < il.size(); i += 3)
+                {
+                    const int a = atomOffset + il.iatoms[i + 1];
+                    const int b = atomOffset + il.iatoms[i + 2];
+                    if (isLA[a] || isLA[b])
+                    {
+                        continue;
+                    }
+                    bonds[a].push_back(b);
+                    bonds[b].push_back(a);
+                }
+            }
+        }
+    }
+
+    const auto chargeOf = [mtop](int a) {
+        int molb = 0;
+        return mtopGetAtomParameters(*mtop, a, &molb).q;
+    };
+
+    potPoints.clear();
+    potChargeShift.clear();
+    isRemovedMM1.clear();
+    if (potScheme != PotScheme::None)
+    {
+        if (linkAtoms.empty())
+        {
+            fprintf(stdout,
+                    "NOTE: GMX_QMMM_POT_SCHEME=%s, but the QM region has no link atoms: there is no "
+                    "MM1 charge to redistribute.\n",
+                    potSchemeName(potScheme));
+        }
+        isRemovedMM1.assign(natoms, false);
+        for (const LinkAtom& l : linkAtoms)
+        {
+            if (isRemovedMM1[l.mm1])
+            {
+                gmx_fatal(FARGS,
+                          "GMX_QMMM_POT_SCHEME=%s: MM atom %d is the MM1 atom of more than one link "
+                          "atom. This is not supported.",
+                          potSchemeName(potScheme), l.mm1 + 1);
+            }
+            isRemovedMM1[l.mm1] = true;
+        }
+    }
+
+    if (potScheme == PotScheme::Amber)
+    {
+        // As in AMBER: the MM1 charges are removed, and their sum is added evenly to the
+        //   other MM atoms of the same molecule.
+        std::vector<int> molStart(natoms), molSize(natoms);
+        int              start = 0;
+        for (const gmx_molblock_t& molb : mtop->molblock)
+        {
+            const int nat = mtop->moltype[molb.type].atoms.nr;
+            for (int mol = 0; mol < molb.nmol; mol++, start += nat)
+            {
+                std::fill(molStart.begin() + start, molStart.begin() + start + nat, start);
+                std::fill(molSize.begin() + start, molSize.begin() + start + nat, nat);
+            }
+        }
+        std::map<int, double> sumOfMolecule; // first atom of the molecule -> sum of its MM1 charges
+        for (const LinkAtom& l : linkAtoms)
+        {
+            sumOfMolecule[molStart[l.mm1]] += chargeOf(l.mm1);
+        }
+        potChargeShift.assign(natoms, real(0.0));
+        for (const auto& mol : sumOfMolecule)
+        {
+            std::vector<int> receivers;
+            for (int a = mol.first; a < mol.first + molSize[mol.first]; a++)
+            {
+                if (!bQM[a] && !isRemovedMM1[a])
+                {
+                    receivers.push_back(a);
+                }
+            }
+            if (receivers.empty())
+            {
+                gmx_fatal(FARGS,
+                          "GMX_QMMM_POT_SCHEME=AMBER: the molecule of atoms %d-%d has no MM atom to "
+                          "spread the MM1 charges to.",
+                          mol.first + 1, mol.first + molSize[mol.first]);
+            }
+            const real shift = static_cast<real>(mol.second / receivers.size());
+            for (int a : receivers)
+            {
+                potChargeShift[a] = shift;
+            }
+            fprintf(stdout,
+                    "QM/MM electrostatics with the boundary charge scheme AMBER: molecule of atoms "
+                    "%d-%d, MM1 charges (sum %+.5f) removed and spread over its %zu other MM atoms, "
+                    "%+.5e each.\n",
+                    mol.first + 1, mol.first + molSize[mol.first], mol.second, receivers.size(), shift);
+        }
+    }
+    else if (potScheme != PotScheme::None)
+    {
+        for (const LinkAtom& l : linkAtoms)
+        {
+            std::vector<int> mm2;
+            for (int b : bonds[l.mm1])
+            {
+                if (!bQM[b])
+                {
+                    mm2.push_back(b);
+                }
+            }
+            if (mm2.empty())
+            {
+                gmx_fatal(FARGS,
+                          "GMX_QMMM_POT_SCHEME=%s: the MM1 atom %d of link atom %d has no MM2 atom to "
+                          "redistribute its charge to.",
+                          potSchemeName(potScheme), l.mm1 + 1, l.la + 1);
+            }
+            for (int b : mm2)
+            {
+                if (isRemovedMM1[b])
+                {
+                    gmx_fatal(FARGS,
+                              "GMX_QMMM_POT_SCHEME=%s: atom %d is an MM2 atom of MM1 atom %d and an MM1 "
+                              "atom itself. This is not supported.",
+                              potSchemeName(potScheme), b + 1, l.mm1 + 1);
+                }
+                for (int c : bonds[b])
+                {
+                    if (bQM[c])
+                    {
+                        gmx_fatal(FARGS,
+                                  "GMX_QMMM_POT_SCHEME=%s: the MM2 atom %d of MM1 atom %d is bonded to "
+                                  "the QM atom %d. This is not supported.",
+                                  potSchemeName(potScheme), b + 1, l.mm1 + 1, c + 1);
+                    }
+                }
+            }
+
+            const real q0 = chargeOf(l.mm1) / mm2.size();
+            for (int b : mm2)
+            {
+                switch (potScheme)
+                {
+                    case PotScheme::RC: potPoints.push_back({ l.mm1, b, real(0.5), q0 }); break;
+                    case PotScheme::RCD:
+                        potPoints.push_back({ l.mm1, b, real(0.5), real(2.0) * q0 });
+                        potPoints.push_back({ l.mm1, b, real(1.0), -q0 });
+                        break;
+                    case PotScheme::CS:
+                    {
+                        /* Charge shift: q0 moves from MM1 onto MM2, which changes the dipole of
+                         * the MM1--MM2 bond by +q0*b (b = MM1->MM2). The compensating pair sits
+                         * at the fractions fMinus and fPlus of the bond and has the dipole
+                         * qPair*(fMinus - fPlus)*b, so qPair = q0 / (fPlus - fMinus) cancels it.
+                         */
+                        constexpr real fMinus = 0.94;
+                        constexpr real fPlus  = 1.06;
+                        const real     qPair  = q0 / (fPlus - fMinus);
+                        potPoints.push_back({ l.mm1, b, real(1.0), q0 });
+                        potPoints.push_back({ l.mm1, b, fMinus, qPair });
+                        potPoints.push_back({ l.mm1, b, fPlus, -qPair });
+                        break;
+                    }
+                    default: break;
+                }
+            }
+        }
+    }
+
+    if (potScheme == PotScheme::None)
+    {
+        fprintf(stdout,
+                "QM/MM electrostatics without a boundary charge scheme -- every MM atom within the "
+                "cut-off interacts with the QM atoms with its full charge (%zu link atoms).\n"
+                "To change, set environment variable GMX_QMMM_POT_SCHEME to RC, RCD, CS or AMBER.\n",
+                linkAtoms.size());
+    }
+    else
+    {
+        fprintf(stdout,
+                "QM/MM electrostatics with the boundary charge scheme %s: %zu MM1 charges removed, "
+                "%zu fictitious point charges added%s.\n"
+                "  The external potential passed to DFTB+ and the QM/MM forces are built from the "
+                "same charges;\n  the forces on the point charges are passed to their MM1 and MM2 "
+                "atoms as for two-atom virtual sites.\n  The MM--MM interactions keep the charges of "
+                "the topology.\n",
+                potSchemeName(potScheme), linkAtoms.size(), potPoints.size(),
+                potScheme == PotScheme::Amber ? " (charges spread over the molecule instead)" : "");
+    }
+
+    if (qmmmReportsEnabled())
+    {
+        const char* reportFile = getenv("GMX_QMMM_EXCLUSION_REPORT");
+        if (reportFile == nullptr)
+        {
+            reportFile = "qmmm_exclusion_report.txt";
+        }
+        writeQmmmChargeReport(*mtop, *this, bQM, reportFile);
+        fprintf(stdout,
+                "The QM/MM boundary charge scheme is listed atom by atom in %s\n"
+                "  (file name set with GMX_QMMM_EXCLUSION_REPORT, switched off with GMX_QMMM_REPORTS=off).\n",
+                reportFile);
+    }
+}
+
+// The charges of the QM--MM electrostatics on the current short-range list. Has to be
+//   redone whenever that list changes, i.e. in every step.
+void QMMM_rec::update_QMMM_boundary_SR()
+{
+    QMMM_MMrec& mm_ = mm[0];
+
+    if (static_cast<int>(localIndexOfAtom.size()) != nAtoms)
+    {
+        localIndexOfAtom.assign(nAtoms, -1);
+    }
+    else
+    {
+        std::fill(localIndexOfAtom.begin(), localIndexOfAtom.end(), -1);
+    }
+    qmmmChargesSR.resize(mm_.nrMMatoms);
+    qmmmScaleSR.resize(mm_.nrMMatoms);
+    for (int k = 0; k < mm_.nrMMatoms; k++)
+    {
+        const int a         = mm_.indexMM[k];
+        localIndexOfAtom[a] = k;
+        qmmmChargesSR[k]    = mm_.MMcharges[k];
+        if (!potChargeShift.empty())
+        {
+            qmmmChargesSR[k] += potChargeShift[a] * mm_.scalefactor;
+        }
+        qmmmScaleSR[k] = (!isRemovedMM1.empty() && isRemovedMM1[a]) ? real(0.0) : real(1.0);
+    }
+
+    // With PME, the reciprocal-space part of a removed MM1 charge is on the grid and can only
+    //   be taken out through the short-range list, see calculate_SR_QM_MM().
+    if (!isRemovedMM1.empty())
+    {
+        for (const LinkAtom& l : linkAtoms)
+        {
+            if (localIndexOfAtom[l.mm1] < 0)
+            {
+                gmx_fatal(FARGS,
+                          "QM/MM boundary charge scheme: the MM1 atom %d is not on the QM/MM "
+                          "short-range list. Increase rcoulomb.",
+                          l.mm1 + 1);
+            }
+        }
+    }
+}
+
+// The charges of the QM--MM electrostatics on the full MM list (PME).
+void QMMM_rec::update_QMMM_boundary_full()
+{
+    QMMM_MMrec& mm_ = mm[0];
+    qmmmChargesFull.resize(mm_.nrMMatoms_full);
+    for (int k = 0; k < mm_.nrMMatoms_full; k++)
+    {
+        qmmmChargesFull[k] = mm_.MMcharges_full[k];
+        if (!potChargeShift.empty())
+        {
+            qmmmChargesFull[k] += potChargeShift[mm_.indexMM_full[k]] * mm_.scalefactor;
+        }
+    }
+}
 
 real QMMM_rec::calculate_QMMM(// const t_commrec*      cr,
                               gmx::ForceWithVirial* forceWithVirial,
