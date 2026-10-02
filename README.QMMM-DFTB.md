@@ -187,3 +187,41 @@ every variant, |F + dE/dx| ≤ 0.025 kJ mol⁻¹ nm⁻¹ for MM1, MM2, QM1 and t
 The virial, as `dU/dε = 2 tr(Ξ)` under isotropic scaling of all coordinates and of the box
 (flexible water): agreement to 0.1 of 7.8·10⁴ kJ/mol with PME and with reaction field;
 the previous code missed 270–280 kJ/mol there, about 75 bar on that box.
+
+## DFTB output files (mdrun)
+
+Each of the following is set to a **positive integer stride in steps**; the file is opened
+in append mode in the run directory on step 0 and written every *N* steps. Unset means no
+file; zero or anything else that is not a positive number is reported and ignored. The
+variables that describe the MM environment are ignored when `GMX_QMMM_VARIANT=0`.
+
+| variable | file | content |
+|---|---|---|
+| `GMX_DFTB_CHARGES=N` | `qm_dftb_charges.xvg` | Mulliken charges of the QM atoms |
+| `GMX_DFTB_ATOMIC_SHIFTS=N` | `qm_dftb_atomic_shifts.xvg` | atomic shifts of the QM atoms (only with a DFTB+ that provides `dftbp_get_atomic_shifts()`) |
+| `GMX_DFTB_ESP=N` | `qm_dftb_esp.xvg` | potential on each QM atom, MM and QM images summed (V) |
+| `GMX_DFTB_ESP_SPLIT=N` | `qm_dftb_esp_split.xvg` | the same potential with the two contributions kept apart |
+| `GMX_DFTB_QM_COORD=N` | `qm_dftb_qm.qxyz` | QM coordinates (Å) and charges |
+| `GMX_DFTB_MM_COORD=N` | `qm_dftb_mm.qxyz` | charges and coordinates (Å) of the MM atoms **on the short-range list**, as they enter the QM–MM electrostatics, followed by the fictitious charges of the boundary scheme |
+| `GMX_DFTB_MM_COORD_FULL=N` | `qm_dftb_mm_full.qxyz` | charges and coordinates of **all** MM atoms (the charges of the PME grid) |
+| `GMX_DFTB_QMMM_GRAD=N` | `qm_dftb_grad.xvg` | gradients on the QM atoms and on the short-range MM atoms |
+| `GMX_DFTB_QMMM_GRAD_FULL=N` | `qm_dftb_grad_full.xvg` | reciprocal-space gradients on **all** MM atoms (PME only) |
+| `GMX_DFTB_ENERGY_CORR=N` | `qm_dftb_energy_corr.xvg` | energy of DFTB+, its correction for the periodic QM images, and the corrected QM energy (kJ/mol) |
+
+`GMX_DFTB_MM_COORD_FULL` and `GMX_DFTB_QMMM_GRAD_FULL` on a solvated system write the whole
+box every *N* steps — pick a large stride.
+
+`qm_dftb_esp_split.xvg` has one row per written step: the step, then three numbers per QM
+atom, in volts — the potential of the MM atoms (with the boundary scheme), that of the
+periodic images of the QM charges (zero unless PME is used), and their sum, which is what
+`qm_dftb_esp.xvg` contains. With the cut-off variants the first number can be recomputed
+from `qm_dftb_qm.qxyz` and `qm_dftb_mm.qxyz` alone.
+
+`qm_dftb_grad.xvg` has, for every written step, one row per QM atom with the running number
+of the QM atom and three vectors — the gradient returned by DFTB+, the electrostatic
+gradient due to the environment (with PME including the periodic QM images), and their
+sum — and one row per MM atom of the short-range list with its running number, its global
+atom number (1-based) and its electrostatic gradient, the forces of the fictitious boundary
+charges included. Units are hartree/bohr; these are gradients, the force is their negative
+(multiply by 4.96147·10⁴ for kJ mol⁻¹ nm⁻¹). An MM atom of the short-range list with PME
+appears in both gradient files, and its gradient is the sum of the two entries.

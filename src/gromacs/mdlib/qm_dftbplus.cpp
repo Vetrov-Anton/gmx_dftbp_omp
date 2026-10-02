@@ -355,6 +355,19 @@ void init_dftbplus(QMMM_QMrec*       qm,
     return;
 } /* init_dftbplus */
 
+/* The stride in steps of a DFTB output file, from its environment variable: a positive
+ * integer, or 0 (no output) for anything else, which is reported. */
+static int dftbOutputStride(const char* name, const char* env)
+{
+    const int stride = atoi(env);
+    if (stride <= 0)
+    {
+        printf("NOTE: %s=%s is not a positive number of steps; no output is written.\n", name, env);
+        return 0;
+    }
+    return stride;
+}
+
 real call_dftbplus(QMMM_rec*         qr,
                 // const t_commrec*  cr,
                    QMMM_QMrec*       qm,
@@ -371,6 +384,14 @@ real call_dftbplus(QMMM_rec*         qr,
     static FILE *f_x_qm = nullptr;
     static FILE *f_x_mm = nullptr;
     static FILE *f_x_mm_full = nullptr;
+    static FILE *f_p_split = nullptr;
+    static FILE *f_grad = nullptr;
+    static FILE *f_grad_full = nullptr;
+    static FILE *f_energy_corr = nullptr;
+    static int output_freq_p_split;
+    static int output_freq_grad;
+    static int output_freq_grad_full;
+    static int output_freq_energy_corr;
     static int output_freq_q;
     static int output_freq_sh;
     static int output_freq_p;
@@ -410,10 +431,12 @@ real call_dftbplus(QMMM_rec*         qr,
 
     if (step == 0) {
         char *env;
+        const bool withMM = (qm->qmmm_variant_get() != eqmmmVACUO);
+        const bool withPME = (qm->qmmm_variant_get() == eqmmmPME);
 
-        if ((env = getenv("GMX_DFTB_CHARGES")) != nullptr)
+        if ((env = getenv("GMX_DFTB_CHARGES")) != nullptr
+            && (output_freq_q = dftbOutputStride("GMX_DFTB_CHARGES", env)) > 0)
         {
-            output_freq_q = atoi(env);
             f_q = fopen("qm_dftb_charges.xvg", "a");
             printf("The QM charges will be saved in file qm_dftb_charges.xvg every %d steps.\n", output_freq_q);
         }
@@ -422,9 +445,11 @@ real call_dftbplus(QMMM_rec*         qr,
         {
             if (GMX_QMMM_DFTBPLUS_ATOMIC_SHIFTS)
             {
-                output_freq_sh = atoi(env);
-                f_sh = fopen("qm_dftb_atomic_shifts.xvg", "a");
-                printf("The QM atomic shifts will be saved in file qm_dftb_atomic_shifts.xvg every %d steps.\n", output_freq_sh);
+                if ((output_freq_sh = dftbOutputStride("GMX_DFTB_ATOMIC_SHIFTS", env)) > 0)
+                {
+                    f_sh = fopen("qm_dftb_atomic_shifts.xvg", "a");
+                    printf("The QM atomic shifts will be saved in file qm_dftb_atomic_shifts.xvg every %d steps.\n", output_freq_sh);
+                }
             }
             else
             {
@@ -433,32 +458,66 @@ real call_dftbplus(QMMM_rec*         qr,
             }
         }
 
-        if (qm->qmmm_variant_get() != eqmmmVACUO && (env = getenv("GMX_DFTB_ESP")) != nullptr)
+        if (withMM && (env = getenv("GMX_DFTB_ESP")) != nullptr
+            && (output_freq_p = dftbOutputStride("GMX_DFTB_ESP", env)) > 0)
         {
-            output_freq_p = atoi(env);
             f_p = fopen("qm_dftb_esp.xvg", "a");
             printf("The MM potential induced on QM atoms will be saved in file qm_dftb_esp.xvg every %d steps.\n", output_freq_p);
         }
 
-        if ((env = getenv("GMX_DFTB_QM_COORD")) != nullptr)
+        // The same potential, but with the two contributions kept apart:
+        //   the MM atoms (with the boundary charge scheme) and the periodic images of the QM charges.
+        if (withMM && (env = getenv("GMX_DFTB_ESP_SPLIT")) != nullptr
+            && (output_freq_p_split = dftbOutputStride("GMX_DFTB_ESP_SPLIT", env)) > 0)
         {
-            output_freq_x_qm = atoi(env);
+            f_p_split = fopen("qm_dftb_esp_split.xvg", "a");
+            printf("The MM and the QM-image contributions to the potential on QM atoms will be saved separately in file qm_dftb_esp_split.xvg every %d steps.\n", output_freq_p_split);
+        }
+
+        if ((env = getenv("GMX_DFTB_QM_COORD")) != nullptr
+            && (output_freq_x_qm = dftbOutputStride("GMX_DFTB_QM_COORD", env)) > 0)
+        {
             f_x_qm = fopen("qm_dftb_qm.qxyz", "a");
             printf("The QM coordinates (XYZQ) will be saved in file qm_dftb_qm.qxyz every %d steps.\n", output_freq_x_qm);
         }
 
-        if (qm->qmmm_variant_get() != eqmmmVACUO && (env = getenv("GMX_DFTB_MM_COORD")) != nullptr)
+        if (withMM && (env = getenv("GMX_DFTB_MM_COORD")) != nullptr
+            && (output_freq_x_mm = dftbOutputStride("GMX_DFTB_MM_COORD", env)) > 0)
         {
-            output_freq_x_mm = atoi(env);
             f_x_mm = fopen("qm_dftb_mm.qxyz", "a");
             printf("The MM coordinates (XYZQ) will be saved in file qm_dftb_mm.qxyz every %d steps.\n", output_freq_x_mm);
         }
 
-        if (qm->qmmm_variant_get() != eqmmmVACUO && (env = getenv("GMX_DFTB_MM_COORD_FULL")) != nullptr)
+        if (withMM && (env = getenv("GMX_DFTB_MM_COORD_FULL")) != nullptr
+            && (output_freq_x_mm_full = dftbOutputStride("GMX_DFTB_MM_COORD_FULL", env)) > 0)
         {
-            output_freq_x_mm_full = atoi(env);
             f_x_mm_full = fopen("qm_dftb_mm_full.qxyz", "a");
             printf("The full MM coordinates (XYZQ) will be saved in file qm_dftb_mm_full.qxyz every %d steps.\n", output_freq_x_mm_full);
+        }
+
+        // Gradients on the QM atoms and on the MM atoms of the short-range list.
+        if (withMM && (env = getenv("GMX_DFTB_QMMM_GRAD")) != nullptr
+            && (output_freq_grad = dftbOutputStride("GMX_DFTB_QMMM_GRAD", env)) > 0)
+        {
+            f_grad = fopen("qm_dftb_grad.xvg", "a");
+            printf("The gradients on the QM atoms and on the short-range MM atoms will be saved in file qm_dftb_grad.xvg every %d steps.\n", output_freq_grad);
+        }
+
+        // Gradients on all of the MM atoms -- only meaningful with PME,
+        //   where the long-range contribution is evaluated for the entire MM subsystem.
+        if (withPME && (env = getenv("GMX_DFTB_QMMM_GRAD_FULL")) != nullptr
+            && (output_freq_grad_full = dftbOutputStride("GMX_DFTB_QMMM_GRAD_FULL", env)) > 0)
+        {
+            f_grad_full = fopen("qm_dftb_grad_full.xvg", "a");
+            printf("The gradients on all of the MM atoms will be saved in file qm_dftb_grad_full.xvg every %d steps.\n", output_freq_grad_full);
+        }
+
+        // The correction of the energy returned by DFTB+ (the periodic QM images, PME).
+        if ((env = getenv("GMX_DFTB_ENERGY_CORR")) != nullptr
+            && (output_freq_energy_corr = dftbOutputStride("GMX_DFTB_ENERGY_CORR", env)) > 0)
+        {
+            f_energy_corr = fopen("qm_dftb_energy_corr.xvg", "a");
+            printf("The correction of the DFTB+ energy and the corrected QM energy will be saved in file qm_dftb_energy_corr.xvg every %d steps.\n", output_freq_energy_corr);
         }
     }
 
@@ -571,6 +630,7 @@ real call_dftbplus(QMMM_rec*         qr,
      *   and the image forces of gradient_QM_MM() (and the virial) are those of the halved
      *   term. The energy is brought in line with them here.
      */
+    const double QMenerDftb = QMener;
     if (qm->qmmm_variant_get() == eqmmmPME)
     {
         double eImage = 0.;
@@ -580,11 +640,63 @@ real call_dftbplus(QMMM_rec*         qr,
         }
         QMener -= 0.5 * eImage;
     }
+    if (f_energy_corr && step % output_freq_energy_corr == 0)
+    {
+        if (step == 0)
+        {
+            fprintf(f_energy_corr, "# step, energy of DFTB+, correction for the periodic QM images, corrected QM energy (kJ/mol)\n");
+        }
+        const double toKJ = gmx::c_hartree2Kj * gmx::c_avogadro;
+        fprintf(f_energy_corr, "%10d %20.10f %20.10f %20.10f\n", step, QMenerDftb * toKJ,
+                (QMener - QMenerDftb) * toKJ, QMener * toKJ);
+        fflush(f_energy_corr);
+    }
 
     rvec *partgrad;
     snew(partgrad, qm->nrQMatoms_get());
     qr->gradient_QM_MM(nrnb, wcycle, // cr ... (qm->qmmm_variant_get() == eqmmmPME ? *qr->pmedata : nullptr),
                    qm->qmmm_variant_get(), partgrad, MMgrad, MMgrad_full);
+
+    /* Optionally, write out the gradients while they are still separated.
+     * At this point, and in atomic units (hartree/bohr):
+     *   QMgrad[]   is the gradient obtained from DFTB+, i.e. the QM subsystem itself;
+     *   partgrad[] is the electrostatic gradient due to the environment -- with PME, this
+     *     includes the periodic images of the QM charges;
+     *   MMgrad[]   is the electrostatic gradient on the MM atoms of the short-range list,
+     *     the forces of the fictitious charges of the boundary scheme included.
+     * The sum of the first two is the total gradient on the QM atom.
+     */
+    if (f_grad && step % output_freq_grad == 0)
+    {
+        fprintf(f_grad, "\nQM gradients: DFTB+, electrostatic, total (hartree/bohr) step %d\n", step);
+        for (int i=0; i<n; i++)
+        {
+            fprintf(f_grad, "QM %5d %12.7f%12.7f%12.7f %12.7f%12.7f%12.7f %12.7f%12.7f%12.7f\n", i+1,
+                QMgrad[i][XX], QMgrad[i][YY], QMgrad[i][ZZ],
+                partgrad[i][XX], partgrad[i][YY], partgrad[i][ZZ],
+                QMgrad[i][XX] + partgrad[i][XX],
+                QMgrad[i][YY] + partgrad[i][YY],
+                QMgrad[i][ZZ] + partgrad[i][ZZ]);
+        }
+        fprintf(f_grad, "MM gradients on the short-range list (hartree/bohr) step %d\n", step);
+        for (int i=0; i<mm.nrMMatoms; i++)
+        {
+            fprintf(f_grad, "MM %5d %8d %12.7f%12.7f%12.7f\n", i+1, mm.indexMM[i] + 1,
+                MMgrad[i][XX], MMgrad[i][YY], MMgrad[i][ZZ]);
+        }
+        fflush(f_grad);
+    }
+
+    if (f_grad_full && step % output_freq_grad_full == 0)
+    {
+        fprintf(f_grad_full, "\nMM gradients on all MM atoms, reciprocal space (hartree/bohr) step %d\n", step);
+        for (int i=0; i<mm.nrMMatoms_full; i++)
+        {
+            fprintf(f_grad_full, "%8d %12.7f%12.7f%12.7f\n", mm.indexMM_full[i] + 1,
+                MMgrad_full[i][XX], MMgrad_full[i][YY], MMgrad_full[i][ZZ]);
+        }
+        fflush(f_grad_full);
+    }
     for (int i=0; i<n; i++)
     {
         rvec_inc(QMgrad[i], partgrad[i]); // sign OK
@@ -662,6 +774,22 @@ real call_dftbplus(QMMM_rec*         qr,
         fprintf(f_p, "\n");
     }
 
+    /* The same potential as above, with the two contributions written out separately:
+     *   the one induced by the MM atoms (with the boundary charge scheme), and the one induced
+     *   by the periodic images of the QM charges (identically zero unless PME is used).
+     */
+    if (f_p_split && step % output_freq_p_split == 0)
+    {
+        fprintf(f_p_split, "%8d", step);
+        for (int i=0; i<n; i++)
+        {
+            fprintf(f_p_split, " %8.5f %8.5f %8.5f",
+                qm->pot_qmmm_get(i), qm->pot_qmqm_get(i),
+                qm->pot_qmmm_get(i) + qm->pot_qmqm_get(i));
+        }
+        fprintf(f_p_split, "\n");
+    }
+
     if (f_x_qm && step % output_freq_x_qm == 0)
     {
         const char periodic_system[37][3]={"XX",
@@ -681,11 +809,27 @@ real call_dftbplus(QMMM_rec*         qr,
 
     if (f_x_mm && step % output_freq_x_mm == 0)
     {
+        /* The charges of the QM--MM electrostatics: with a boundary charge scheme a removed MM1
+         * atom has zero charge here, the AMBER shares are included, and the fictitious charges
+         * follow the MM atoms, so that the potential on the QM atoms can be recomputed from
+         * this file alone (with the cut-off variants; with PME the reciprocal space adds to it).
+         */
         fprintf(f_x_mm, "\nMM coordinates and charges step %d\n", step);
         for (int i=0; i<mm.nrMMatoms; i++) {
             fprintf(f_x_mm, "%10.7f%10.5f%10.5f%10.5f\n",
-                mm.MMcharges[i], // CHECK -- HOW TO DO IT WITH PME / WITH CUT-OFF?
+                qr->qmmmChargesSR[i] * qr->qmmmScaleSR[i],
                 mm.xMM[i][0] * 10., mm.xMM[i][1] * 10., mm.xMM[i][2] * 10.);
+        }
+        if (!qr->potPoints.empty())
+        {
+            fprintf(f_x_mm, "fictitious charges of the boundary scheme step %d\n", step);
+            for (const QMMM_rec::PotPoint& pt : qr->potPoints)
+            {
+                rvec xp;
+                qr->boundary_point_position(pt, xp);
+                fprintf(f_x_mm, "%10.7f%10.5f%10.5f%10.5f\n", pt.q * mm.scalefactor,
+                        xp[0] * 10., xp[1] * 10., xp[2] * 10.);
+            }
         }
     }
 
@@ -695,7 +839,7 @@ real call_dftbplus(QMMM_rec*         qr,
         fprintf(f_x_mm_full, "\nfull MM coordinates and charges step %d\n", step);
         for (int i=0; i<mm.nrMMatoms_full; i++) {
             fprintf(f_x_mm_full, "%10.7f%10.5f%10.5f%10.5f\n",
-                mm.MMcharges_full[i], // CHECK -- HOW TO DO IT WITH PME / WITH CUT-OFF?
+                qr->qmmmChargesFull[i], // the charges on the PME grid (incl. the AMBER shares)
                 mm.xMM_full[i][0] * 10., mm.xMM_full[i][1] * 10., mm.xMM_full[i][2] * 10.);
         }
     }
