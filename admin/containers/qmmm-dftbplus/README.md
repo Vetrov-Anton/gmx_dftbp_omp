@@ -36,9 +36,9 @@ identifies as Intel. `libmklfix.so` (`mklfix.c`) defines that function and is a 
   `MKL_VENDOR_OVERRIDE=on` forces it.
 - The QM/MM report files (`qmmm_topology_report.txt` of grompp and
   `qmmm_redistribution_report.txt` of mdrun) are off by default in the image: its environment
-  sets `GMX_QMMM_REPORTS=off` unless the variable is already set. `GMX_QMMM_REPORTS=on` in the
-  host environment, with `apptainer exec --env`, or with `env` inside the container switches
-  them on.
+  sets `GMX_QMMM_REPORTS=off`. `apptainer exec --env GMX_QMMM_REPORTS=on`,
+  `APPTAINERENV_GMX_QMMM_REPORTS=on` on the host, or `env GMX_QMMM_REPORTS=on gmx ...` inside the
+  container switches them on; a plain host variable of that name is not passed into the container.
 
 `build.sh` passes the sources as `git archive HEAD`; commit before building.
 

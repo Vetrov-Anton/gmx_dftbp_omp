@@ -48,7 +48,8 @@ From: ubuntu:24.04
     export PLUMED_KERNEL=/opt/plumed/lib/libplumedKernel.so
     unset OMP_NUM_THREADS
     # The QM/MM report files (qmmm_topology_report.txt of grompp, qmmm_redistribution_report.txt of mdrun)
-    # are off by default in the image; GMX_QMMM_REPORTS=on (host environment or --env) switches them on.
+    # are off by default in the image; apptainer exec --env GMX_QMMM_REPORTS=on (or APPTAINERENV_GMX_QMMM_REPORTS=on,
+    # or "env GMX_QMMM_REPORTS=on gmx ..." inside the container) switches them on. A plain host variable is not passed.
     export GMX_QMMM_REPORTS=${GMX_QMMM_REPORTS:-off}
 
 %post -c /bin/bash
