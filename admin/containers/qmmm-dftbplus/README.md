@@ -34,6 +34,11 @@ identifies as Intel. `libmklfix.so` (`mklfix.c`) defines that function and is a 
 - `amd`: always 1. `intel`: the library is not built or linked.
 - At run time, `MKL_VENDOR_OVERRIDE=off` switches the override off (MKL's own check),
   `MKL_VENDOR_OVERRIDE=on` forces it.
+- The QM/MM report files (`qmmm_topology_report.txt` of grompp and
+  `qmmm_redistribution_report.txt` of mdrun) are off by default in the image: its environment
+  sets `GMX_QMMM_REPORTS=off` unless the variable is already set. `GMX_QMMM_REPORTS=on` in the
+  host environment, with `apptainer exec --env`, or with `env` inside the container switches
+  them on.
 
 `build.sh` passes the sources as `git archive HEAD`; commit before building.
 
