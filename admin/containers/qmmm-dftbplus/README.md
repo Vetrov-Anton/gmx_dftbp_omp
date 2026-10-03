@@ -66,6 +66,6 @@ apptainer exec -B /data --env LD_PRELOAD= gmx-dftbplus-mkl.sif \
 ```
 
 Use `Solver = DivideAndConquer {}` in the `Hamiltonian = DFTB` block of `dftb_in.hsd`: with
-MKL it diagonalises 1.5× faster than the default on 8 threads. See `README.QMMM-DFTB.md` at
+MKL it diagonalises 1.5× faster than the default on 8 threads. See `README.md` at
 the top of the tree for the QM/MM options, threads (`GMX_QMMM_DFTB_NTHREADS`) and timings
 (`GMX_QMMM_TIMING`).

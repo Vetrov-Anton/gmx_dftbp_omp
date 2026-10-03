@@ -1,8 +1,32 @@
-# QM/MM with DFTB+ in this GROMACS tree
+# GROMACS with DFTB+ QM/MM on one MPI rank with OpenMP
 
-GROMACS 2026 with the DFTB+ QM/MM interface of Kubař *et al.* The QM region is
-described by DFTB+ called as a library through its C API; the electrostatic
-QM/MM coupling (cut-off variants or PME) is computed by GROMACS.
+GROMACS 2026 with the DFTB+ QM/MM interface of Kubař *et al.*
+([tomaskubar/gromacs-dftbplus](https://github.com/tomaskubar/gromacs-dftbplus)), extended in
+this repository. The QM region is described by DFTB+ called as a library through its C API;
+the electrostatic QM/MM coupling (cut-off variants or PME) is computed by GROMACS.
+
+What this repository adds to the original interface:
+
+- DFTB+ 21.x to 25.x and forks linked through the C API;
+- `classic` and `amber` treatment of the bonded terms at the QM/MM boundary, restraints kept,
+  report of everything grompp removes;
+- boundary charge schemes `RC`, `RCD`, `CS` and `AMBER` for the QM–MM electrostatics, with
+  forces that are the gradient of the energy (also with PME);
+- corrected energy of the periodic QM images and the QM/MM virial;
+- diagnostic DFTB output files;
+- OpenMP parallel QM/MM on one MPI rank (works with PLUMED), with OpenBLAS, Intel MKL or AOCL;
+- a container recipe on Intel MKL for Intel and AMD CPUs.
+
+| | |
+|---|---|
+| Container image (GROMACS + DFTB+ + PLUMED on MKL) | [admin/containers/qmmm-dftbplus](admin/containers/qmmm-dftbplus/README.md) |
+| GROMACS itself: README, license | [README](README), [COPYING](COPYING) (LGPL 2.1) |
+
+Contents: [Building](#building) ·
+[Topology at the QM/MM boundary](#topology-at-the-qmmm-boundary-grompp) ·
+[QM–MM electrostatics at the boundary](#qmmm-electrostatics-at-the-boundary-mdrun) ·
+[DFTB output files](#dftb-output-files-mdrun) ·
+[Parallel runs](#parallel-runs-one-mpi-rank-openmp-threads)
 
 ## Building
 
@@ -303,6 +327,6 @@ With MKL on 600 QM atoms: 8685 / 4778 / 3380 / 2389 ms/step on 1 / 2 / 4 / 8 thr
 than the default `RelativelyRobust` with MKL on 8 threads; the energies are the same).
 
 On AMD CPUs, MKL uses its fast code paths only if `mkl_serv_intel_cpu_true()` returns 1; the
-MKL image (`gmx_kubar_dftb25_mkl.def`) makes a library with that function a `DT_NEEDED` of
+MKL image ([admin/containers/qmmm-dftbplus](admin/containers/qmmm-dftbplus/README.md)) makes a library with that function a `DT_NEEDED` of
 `gmx` and `dftb+`. mdrun prints which paths MKL takes. Without it, MKL is slower than
 OpenBLAS (3474 instead of 2495 ms/step above).
