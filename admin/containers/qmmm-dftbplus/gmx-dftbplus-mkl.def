@@ -1,0 +1,156 @@
+Bootstrap: docker
+From: ubuntu:24.04
+
+# ---------------------------------------------------------------------------
+# GROMACS (this tree: Kubar's DFTB+ QM/MM with the one-rank OpenMP work) + DFTB+ + PLUMED,
+# all on Intel MKL, for an Intel or an AMD CPU. Build with build.sh next to this file:
+#
+#   ./build.sh amd   gmx-dftbplus-mkl-amd.sif
+#   ./build.sh intel gmx-dftbplus-mkl-intel.sif
+#   ./build.sh amd   zen4.sif --build-arg GMX_SIMD=AVX_512      # any argument below
+#
+# CPU_VENDOR selects how MKL is set up:
+#   intel  MKL picks its code paths by itself.
+#   amd    MKL takes its fast (AVX2/AVX-512) paths only on CPUs it identifies as Intel
+#          (mkl_serv_intel_cpu_true(); MKL_DEBUG_CPU_TYPE has no effect since MKL 2020.1).
+#          libmklfix.so, which returns 1 from that function, is made a DT_NEEDED of gmx and
+#          dftb+, ahead of MKL in the symbol lookup order, so no LD_PRELOAD is needed.
+#          On 600 QM atoms, 8 threads of a Threadripper 3990X: 3474 -> 2495 ms/step.
+# GMX_SIMD defaults to AVX2_256 for amd (Zen 1-3) and AVX_512 for intel; set AVX_512 for
+# Zen 4/5, AVX2_256 for Intel CPUs without AVX-512.
+#
+# One LAPACK per process: GROMACS uses MKL as its external BLAS/LAPACK too. With OpenBLAS in
+# libgromacs the LAPACK calls of DFTB+ go to OpenBLAS; with the internal LAPACK of GROMACS
+# they go to that incomplete copy (segfault in dlaswp_). Both are checked below.
+# ---------------------------------------------------------------------------
+
+%arguments
+    CPU_VENDOR=amd
+    GMX_SIMD=auto
+    NJOBS=8
+    DFTBPLUS_VERSION=25.1
+    PLUMED_COMMIT=53a1773
+    PLUMED_PATCH=gromacs-2026.0
+    LIBTORCH_URL=https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-2.2.0%2Bcpu.zip
+    SRC_TARBALL=gromacs-src.tar.gz
+
+%files
+    {{ SRC_TARBALL }} /opt/src/gromacs-src.tar.gz
+
+%environment
+    export PATH=/opt/gmx/bin:/opt/plumed/bin:/opt/dftbplus/bin:${PATH}
+    export LD_LIBRARY_PATH=/opt/gmx/lib:/opt/plumed/lib:/opt/libtorch/lib:/opt/dftbplus/lib:${LD_LIBRARY_PATH}
+    export PLUMED_KERNEL=/opt/plumed/lib/libplumedKernel.so
+    unset OMP_NUM_THREADS
+
+%post -c /bin/bash
+    set -e -x
+    export DEBIAN_FRONTEND=noninteractive
+    CPU_VENDOR={{ CPU_VENDOR }}
+    GMX_SIMD={{ GMX_SIMD }}
+    NJOBS={{ NJOBS }}
+    case ${CPU_VENDOR} in
+        amd)   [ ${GMX_SIMD} = auto ] && GMX_SIMD=AVX2_256 ;;
+        intel) [ ${GMX_SIMD} = auto ] && GMX_SIMD=AVX_512 ;;
+        *) echo "ERROR: CPU_VENDOR must be amd or intel, not '${CPU_VENDOR}'"; exit 1 ;;
+    esac
+    printf "CPU_VENDOR=%s\nGMX_SIMD=%s\n" ${CPU_VENDOR} ${GMX_SIMD} > /opt/build_config.txt
+    M=/usr/lib/x86_64-linux-gnu
+
+    # ------------------------- toolchain and MKL ------------------------------
+    apt-get update -y
+    echo "libmkl-rt libmkl-rt/use-as-default-blas-lapack boolean false" | debconf-set-selections
+    apt-get install -y --no-install-recommends -o Acquire::Retries=5 \
+        ca-certificates wget git unzip xxd patch file patchelf binutils \
+        build-essential gfortran cmake ninja-build \
+        libfftw3-dev libgsl-dev zlib1g-dev libopenmpi-dev openmpi-bin \
+        python3 python3-dev python3-numpy hwloc numactl vim less \
+        libmkl-dev libmkl-gnu-thread libmkl-gf-lp64 libmkl-core libmkl-avx2 libmkl-avx512 libmkl-def
+    GOMP=$(gfortran -print-file-name=libgomp.so)
+    MKLLIBS="${M}/libmkl_gf_lp64.so;${M}/libmkl_gnu_thread.so;${M}/libmkl_core.so;${GOMP};${M}/libm.so"
+
+    # ------------------------- DFTB+ on MKL -> /opt/dftbplus -------------------
+    mkdir -p /opt/src && cd /opt/src && rm -rf dftbplus
+    git clone --recursive --depth 1 -b {{ DFTBPLUS_VERSION }} https://github.com/dftbplus/dftbplus.git
+    cd dftbplus
+    cmake -B _build -G Ninja -DCMAKE_INSTALL_PREFIX=/opt/dftbplus -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=ON -DWITH_API=ON -DENABLE_DYNAMIC_LOADING=ON \
+        -DWITH_TBLITE=ON -DWITH_SDFTD3=ON -DWITH_MPI=OFF -DWITH_OMP=ON -DWITH_PYTHON=OFF \
+        -DBUILD_TESTING=OFF -DBLAS_LIBRARY="${MKLLIBS}" -DLAPACK_LIBRARY="${MKLLIBS}" \
+        -DHYBRID_CONFIG_METHODS="Submodule;Find;Fetch"
+    cmake --build _build -- -j${NJOBS}
+    cmake --install _build
+    cd /opt/src && rm -rf dftbplus
+
+    # ------------------------- libtorch, PLUMED -> /opt/plumed ------------------
+    cd /tmp && wget -q -O libtorch.zip "{{ LIBTORCH_URL }}"
+    cd /opt && unzip -q /tmp/libtorch.zip && rm -f /tmp/libtorch.zip
+    cd /tmp && rm -rf plumed2
+    git clone -b v2.10 https://github.com/plumed/plumed2.git plumed2
+    cd plumed2 && git checkout {{ PLUMED_COMMIT }}
+    export CPATH=${CPATH:-}:/opt/libtorch/include/torch/csrc/api/include:/opt/libtorch/include
+    export LIBRARY_PATH=${LIBRARY_PATH:-}:/opt/libtorch/lib
+    export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/opt/libtorch/lib
+    ./configure --prefix=/opt/plumed --enable-modules=all --enable-libtorch CC=mpicc CXX=mpicxx
+    make -j ${NJOBS} && make install
+    cd /tmp && rm -rf plumed2
+
+    # ------------------------- GROMACS on MKL -> /opt/gmx ----------------------
+    export PATH=/opt/plumed/bin:${PATH}
+    export LD_LIBRARY_PATH=/opt/plumed/lib:/opt/dftbplus/lib:${LD_LIBRARY_PATH}
+    cd /opt/src && mkdir gromacs && tar xzf gromacs-src.tar.gz -C gromacs --strip-components=1
+    cd gromacs
+    plumed --no-mpi patch -p -e {{ PLUMED_PATCH }}
+    if find . -name "*.rej" | grep -q . ; then echo "ERROR: rejected plumed hunks"; exit 1; fi
+    cmake -S . -B build -G Ninja -DCMAKE_INSTALL_PREFIX=/opt/gmx -DCMAKE_BUILD_TYPE=Release \
+        -DGMX_DOUBLE=ON -DGMX_MPI=ON -DGMX_OPENMP=ON -DGMX_GPU=OFF -DGMX_DEFAULT_SUFFIX=OFF \
+        -DGMX_SIMD=${GMX_SIMD} -DGMX_FFT_LIBRARY=fftw3 -DGMX_BUILD_OWN_FFTW=OFF \
+        -DGMX_EXTERNAL_BLAS=ON -DGMX_EXTERNAL_LAPACK=ON \
+        -DGMX_BLAS_USER="${MKLLIBS}" -DGMX_LAPACK_USER="${MKLLIBS}" \
+        -DGMXAPI=OFF -DGMX_INSTALL_NBLIB_API=OFF \
+        -DGMX_BUILD_MANUAL=OFF -DBUILD_TESTING=OFF -DGMX_BUILD_UNITTESTS=OFF \
+        -DGMX_USE_PLUMED=ON -DGMX_QMMM_PROGRAM=dftbplus -DGMX_QMMM_DFTBPLUS_LIB=/opt/dftbplus
+    cmake --build build -j ${NJOBS}
+    cmake --install build
+    cd /opt/src && rm -rf gromacs gromacs-src.tar.gz
+    export LD_LIBRARY_PATH=/opt/gmx/lib:${LD_LIBRARY_PATH}
+    if ldd /opt/gmx/bin/gmx | grep -q openblas; then echo "ERROR: OpenBLAS loaded by gmx"; exit 1; fi
+    if nm -D --defined-only /opt/gmx/lib/libgromacs.so | grep -qw dgetrs_; then echo "ERROR: libgromacs exports its own LAPACK"; exit 1; fi
+
+    # ------------------------- MKL on AMD --------------------------------------
+    if [ ${CPU_VENDOR} = amd ]; then
+        mkdir -p /opt/mklfix
+        echo 'int mkl_serv_intel_cpu_true(void) { return 1; }' > /opt/mklfix/mklfix.c
+        gcc -shared -fPIC -O2 -o /opt/mklfix/libmklfix.so /opt/mklfix/mklfix.c
+        for exe in /opt/gmx/bin/gmx /opt/dftbplus/bin/dftb+; do
+            patchelf --add-needed /opt/mklfix/libmklfix.so ${exe}
+            readelf -d ${exe} | grep -q libmklfix
+        done
+    fi
+
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+%test
+    export LD_LIBRARY_PATH=/opt/gmx/lib:/opt/plumed/lib:/opt/libtorch/lib:/opt/dftbplus/lib:${LD_LIBRARY_PATH:-}
+    cat /opt/build_config.txt
+    ldd /opt/gmx/bin/gmx | grep -E "mkl|openblas|dftbplus"
+    ! ldd /opt/gmx/bin/gmx | grep -q openblas && echo "OK: MKL is the only BLAS/LAPACK"
+    if grep -q "CPU_VENDOR=amd" /opt/build_config.txt; then
+        readelf -d /opt/gmx/bin/gmx | grep -q libmklfix && echo "OK: MKL vendor check override linked (amd)"
+    else
+        ! readelf -d /opt/gmx/bin/gmx | grep -q libmklfix && echo "OK: no vendor check override (intel)"
+    fi
+    # gmx itself may not start here if GMX_SIMD is not supported by the build host
+    /opt/gmx/bin/gmx --version 2>&1 | grep -E "GROMACS version|SIMD instructions|Plumed support" || true
+
+%help
+    GROMACS (Kubar DFTB+ QM/MM, one-rank OpenMP) + DFTB+ + PLUMED on Intel MKL.
+    cat /opt/build_config.txt shows the CPU vendor and SIMD the image was built for.
+
+        apptainer exec -B /data --env LD_PRELOAD= image.sif \
+            gmx mdrun -deffnm md -ntomp 8 -pin on [-pinoffset ... -pinstride ...] [-plumed plumed.dat]
+
+    In dftb_in.hsd, Solver = DivideAndConquer {} is the fastest eigensolver with MKL.
+    mdrun reports at startup: the MKL version, its thread count, and whether MKL takes the
+    Intel code paths (mkl_serv_intel_cpu_true() = 1).
