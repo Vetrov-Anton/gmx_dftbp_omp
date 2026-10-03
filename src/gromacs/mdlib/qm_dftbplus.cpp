@@ -266,7 +266,30 @@ static void setUpDftbBlasThreads(int numThreads)
     const auto setThreads  = reinterpret_cast<SetInt>(dlsym(RTLD_DEFAULT, "openblas_set_num_threads"));
     if (getParallel == nullptr)
     {
-        printf("QM/MM threads: the BLAS/LAPACK of DFTB+ is not OpenBLAS; its threading is not controlled by mdrun.\n");
+        /* Intel MKL: with the GNU OpenMP layer (mkl_gnu_thread) it runs on the OpenMP threads of
+         * mdrun and follows omp_set_num_threads(); MKL_Set_Num_Threads() makes that explicit. */
+        using GetVersion  = void (*)(char*, int);
+        const auto mklVersion = reinterpret_cast<GetVersion>(dlsym(RTLD_DEFAULT, "mkl_get_version_string"));
+        const auto mklThreads = reinterpret_cast<SetInt>(dlsym(RTLD_DEFAULT, "MKL_Set_Num_Threads"));
+        if (mklVersion != nullptr)
+        {
+            char version[256] = { 0 };
+            mklVersion(version, sizeof(version) - 1);
+            if (mklThreads != nullptr)
+            {
+                mklThreads(numThreads);
+            }
+            const auto intelCpuTrue = reinterpret_cast<GetInt>(dlsym(RTLD_DEFAULT, "mkl_serv_intel_cpu_true"));
+            printf("QM/MM threads: BLAS/LAPACK of DFTB+ is Intel MKL (%s), %d threads.\n", version,
+                   numThreads);
+            if (intelCpuTrue != nullptr)
+            {
+                printf("QM/MM threads: MKL reports %s CPU code paths (mkl_serv_intel_cpu_true() = %d).\n",
+                       intelCpuTrue() ? "Intel" : "generic (non-Intel)", intelCpuTrue());
+            }
+            return;
+        }
+        printf("QM/MM threads: the BLAS/LAPACK of DFTB+ is neither OpenBLAS nor MKL; its threading is not controlled by mdrun.\n");
         return;
     }
     const int   mode     = getParallel(); // 0 sequential, 1 pthreads, 2 OpenMP
