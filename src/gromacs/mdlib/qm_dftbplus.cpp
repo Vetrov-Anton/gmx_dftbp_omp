@@ -47,6 +47,7 @@
 
 #include <dlfcn.h>
 #include <chrono>
+#include <cstdint>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -289,7 +290,22 @@ static void setUpDftbBlasThreads(int numThreads)
             }
             return;
         }
-        printf("QM/MM threads: the BLAS/LAPACK of DFTB+ is neither OpenBLAS nor MKL; its threading is not controlled by mdrun.\n");
+        /* BLIS (e.g. AMD AOCL-BLIS) built on OpenMP, with libFLAME as LAPACK. */
+        using GetCString = const char* (*)();
+        using SetInt64   = void (*)(int64_t);
+        const auto bliVersion = reinterpret_cast<GetCString>(dlsym(RTLD_DEFAULT, "bli_info_get_version_str"));
+        const auto bliThreads = reinterpret_cast<SetInt64>(dlsym(RTLD_DEFAULT, "bli_thread_set_num_threads"));
+        if (bliVersion != nullptr)
+        {
+            if (bliThreads != nullptr)
+            {
+                bliThreads(numThreads);
+            }
+            printf("QM/MM threads: BLAS of DFTB+ is BLIS (%s), %d threads%s.\n", bliVersion(), numThreads,
+                   dlsym(RTLD_DEFAULT, "FLA_Init") != nullptr ? "; LAPACK is libFLAME" : "");
+            return;
+        }
+        printf("QM/MM threads: the BLAS/LAPACK of DFTB+ is neither OpenBLAS, MKL nor BLIS; its threading is not controlled by mdrun.\n");
         return;
     }
     const int   mode     = getParallel(); // 0 sequential, 1 pthreads, 2 OpenMP
