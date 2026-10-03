@@ -3,21 +3,25 @@ From: ubuntu:24.04
 
 # ---------------------------------------------------------------------------
 # GROMACS (this tree: Kubar's DFTB+ QM/MM with the one-rank OpenMP work) + DFTB+ + PLUMED,
-# all on Intel MKL, for an Intel or an AMD CPU. Build with build.sh next to this file:
+# all on Intel MKL, for Intel and AMD CPUs. Build with build.sh next to this file:
 #
-#   ./build.sh amd   gmx-dftbplus-mkl-amd.sif
-#   ./build.sh intel gmx-dftbplus-mkl-intel.sif
-#   ./build.sh amd   zen4.sif --build-arg GMX_SIMD=AVX_512      # any argument below
+#   ./build.sh                       gmx-dftbplus-mkl.sif     # CPU vendor detected at run time
+#   ./build.sh auto gmx.sif --build-arg GMX_SIMD=AVX_512        # any argument below
 #
-# CPU_VENDOR selects how MKL is set up:
-#   intel  MKL picks its code paths by itself.
-#   amd    MKL takes its fast (AVX2/AVX-512) paths only on CPUs it identifies as Intel
-#          (mkl_serv_intel_cpu_true(); MKL_DEBUG_CPU_TYPE has no effect since MKL 2020.1).
-#          libmklfix.so, which returns 1 from that function, is made a DT_NEEDED of gmx and
-#          dftb+, ahead of MKL in the symbol lookup order, so no LD_PRELOAD is needed.
-#          On 600 QM atoms, 8 threads of a Threadripper 3990X: 3474 -> 2495 ms/step.
-# GMX_SIMD defaults to AVX2_256 for amd (Zen 1-3) and AVX_512 for intel; set AVX_512 for
-# Zen 4/5, AVX2_256 for Intel CPUs without AVX-512.
+# MKL takes its fast (AVX2/AVX-512) paths only on CPUs it identifies as Intel
+# (mkl_serv_intel_cpu_true(); MKL_DEBUG_CPU_TYPE has no effect since MKL 2020.1). libmklfix.so
+# (mklfix.c) defines that function and is made a DT_NEEDED of gmx and dftb+, ahead of MKL in the
+# symbol lookup order, so no LD_PRELOAD is needed. CPU_VENDOR:
+#   auto   (default) the vendor is read with CPUID when the program runs: 1 on AMD, MKL's own
+#          answer on Intel. The same image is right on both; MKL_VENDOR_OVERRIDE=off|on at run
+#          time switches the override off or forces it.
+#   amd    always 1 (as auto on an AMD CPU).
+#   intel  no override library at all.
+# On 600 QM atoms, 8 threads of a Threadripper 3990X: 3474 -> 2495 ms/step with the override.
+#
+# GMX_SIMD: auto = detected by GROMACS on the build host (written to /opt/build_config.txt);
+# set it (AVX2_256, AVX_512, ...) when the image is built on another machine than the one
+# it runs on.
 #
 # One LAPACK per process: GROMACS uses MKL as its external BLAS/LAPACK too. With OpenBLAS in
 # libgromacs the LAPACK calls of DFTB+ go to OpenBLAS; with the internal LAPACK of GROMACS
@@ -25,7 +29,7 @@ From: ubuntu:24.04
 # ---------------------------------------------------------------------------
 
 %arguments
-    CPU_VENDOR=amd
+    CPU_VENDOR=auto
     GMX_SIMD=auto
     NJOBS=8
     DFTBPLUS_VERSION=25.1
@@ -36,6 +40,7 @@ From: ubuntu:24.04
 
 %files
     {{ SRC_TARBALL }} /opt/src/gromacs-src.tar.gz
+    mklfix.c /opt/mklfix/mklfix.c
 
 %environment
     export PATH=/opt/gmx/bin:/opt/plumed/bin:/opt/dftbplus/bin:${PATH}
@@ -50,11 +55,10 @@ From: ubuntu:24.04
     GMX_SIMD={{ GMX_SIMD }}
     NJOBS={{ NJOBS }}
     case ${CPU_VENDOR} in
-        amd)   [ ${GMX_SIMD} = auto ] && GMX_SIMD=AVX2_256 ;;
-        intel) [ ${GMX_SIMD} = auto ] && GMX_SIMD=AVX_512 ;;
-        *) echo "ERROR: CPU_VENDOR must be amd or intel, not '${CPU_VENDOR}'"; exit 1 ;;
+        auto|amd|intel) ;;
+        *) echo "ERROR: CPU_VENDOR must be auto, amd or intel, not '${CPU_VENDOR}'"; exit 1 ;;
     esac
-    printf "CPU_VENDOR=%s\nGMX_SIMD=%s\n" ${CPU_VENDOR} ${GMX_SIMD} > /opt/build_config.txt
+    [ ${GMX_SIMD} = auto ] && GMX_SIMD=AUTO
     M=/usr/lib/x86_64-linux-gnu
 
     # ------------------------- toolchain and MKL ------------------------------
@@ -112,16 +116,18 @@ From: ubuntu:24.04
         -DGMX_USE_PLUMED=ON -DGMX_QMMM_PROGRAM=dftbplus -DGMX_QMMM_DFTBPLUS_LIB=/opt/dftbplus
     cmake --build build -j ${NJOBS}
     cmake --install build
+    SIMD_USED=$(grep "^GMX_SIMD_ACTIVE:" build/CMakeCache.txt | cut -d= -f2)
+    BUILD_HOST_CPU=$(grep -m1 "^vendor_id" /proc/cpuinfo | awk '{print $3}')
+    printf "CPU_VENDOR=%s\nGMX_SIMD=%s\nbuild host CPU=%s\n" ${CPU_VENDOR} ${SIMD_USED} ${BUILD_HOST_CPU} > /opt/build_config.txt
     cd /opt/src && rm -rf gromacs gromacs-src.tar.gz
     export LD_LIBRARY_PATH=/opt/gmx/lib:${LD_LIBRARY_PATH}
     if ldd /opt/gmx/bin/gmx | grep -q openblas; then echo "ERROR: OpenBLAS loaded by gmx"; exit 1; fi
     if nm -D --defined-only /opt/gmx/lib/libgromacs.so | grep -qw dgetrs_; then echo "ERROR: libgromacs exports its own LAPACK"; exit 1; fi
 
-    # ------------------------- MKL on AMD --------------------------------------
-    if [ ${CPU_VENDOR} = amd ]; then
-        mkdir -p /opt/mklfix
-        echo 'int mkl_serv_intel_cpu_true(void) { return 1; }' > /opt/mklfix/mklfix.c
-        gcc -shared -fPIC -O2 -o /opt/mklfix/libmklfix.so /opt/mklfix/mklfix.c
+    # ------------------------- MKL vendor check -------------------------------
+    if [ ${CPU_VENDOR} != intel ]; then
+        FIXFLAGS=""; [ ${CPU_VENDOR} = amd ] && FIXFLAGS="-DMKLFIX_ALWAYS"
+        gcc -shared -fPIC -O2 ${FIXFLAGS} -o /opt/mklfix/libmklfix.so /opt/mklfix/mklfix.c -ldl
         for exe in /opt/gmx/bin/gmx /opt/dftbplus/bin/dftb+; do
             patchelf --add-needed /opt/mklfix/libmklfix.so ${exe}
             readelf -d ${exe} | grep -q libmklfix
@@ -136,8 +142,8 @@ From: ubuntu:24.04
     cat /opt/build_config.txt
     ldd /opt/gmx/bin/gmx | grep -E "mkl|openblas|dftbplus"
     ! ldd /opt/gmx/bin/gmx | grep -q openblas && echo "OK: MKL is the only BLAS/LAPACK"
-    if grep -q "CPU_VENDOR=amd" /opt/build_config.txt; then
-        readelf -d /opt/gmx/bin/gmx | grep -q libmklfix && echo "OK: MKL vendor check override linked (amd)"
+    if ! grep -q "CPU_VENDOR=intel" /opt/build_config.txt; then
+        readelf -d /opt/gmx/bin/gmx | grep -q libmklfix && echo "OK: MKL vendor check override linked"
     else
         ! readelf -d /opt/gmx/bin/gmx | grep -q libmklfix && echo "OK: no vendor check override (intel)"
     fi

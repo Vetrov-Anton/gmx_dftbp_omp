@@ -8,17 +8,32 @@
 - PLUMED v2.10 with libtorch (runtime-loaded through `PLUMED_KERNEL`).
 
 ```bash
-./build.sh amd   gmx-dftbplus-mkl-amd.sif
-./build.sh intel gmx-dftbplus-mkl-intel.sif
-./build.sh amd   gmx-zen4.sif --build-arg GMX_SIMD=AVX_512 --build-arg NJOBS=16
+./build.sh                                      # -> gmx-dftbplus-mkl.sif, works on Intel and AMD
+./build.sh auto gmx-zen4.sif --build-arg GMX_SIMD=AVX_512 --build-arg NJOBS=16
 ```
 
 | build argument | values | default | effect |
 |---|---|---|---|
-| `CPU_VENDOR` | `amd`, `intel` | `amd` (set by `build.sh`) | `amd`: `libmklfix.so` (`mkl_serv_intel_cpu_true()` = 1) becomes a `DT_NEEDED` of `gmx` and `dftb+`, so MKL takes its fast code paths on AMD CPUs. `intel`: MKL is used as it is. |
-| `GMX_SIMD` | `auto`, any GROMACS `GMX_SIMD` | `auto` = `AVX2_256` (amd), `AVX_512` (intel) | SIMD of GROMACS. Zen 4/5: `AVX_512`; Intel without AVX-512: `AVX2_256`. |
+| `CPU_VENDOR` | `auto`, `amd`, `intel` | `auto` | how MKL treats the CPU, see below |
+| `GMX_SIMD` | `auto`, any GROMACS `GMX_SIMD` | `auto` | SIMD of GROMACS; `auto` = detected on the build host. Set it when the image runs on another CPU generation (e.g. `AVX_512` for Zen 4/5 and Xeon, `AVX2_256` for Zen 1–3) |
 | `NJOBS` | integer | 8 | parallel build jobs |
 | `DFTBPLUS_VERSION`, `PLUMED_COMMIT`, `PLUMED_PATCH`, `LIBTORCH_URL` | | 25.1, 53a1773, gromacs-2026.0, libtorch 2.2.0 cpu | versions |
+
+`/opt/build_config.txt` in the image records the vendor mode, the SIMD used and the CPU of
+the build host.
+
+### CPU vendor (`CPU_VENDOR`)
+
+MKL takes its fast code paths only on CPUs that its internal `mkl_serv_intel_cpu_true()`
+identifies as Intel. `libmklfix.so` (`mklfix.c`) defines that function and is a `DT_NEEDED` of
+`gmx` and `dftb+`, ahead of MKL, so MKL calls it instead (no `LD_PRELOAD` needed):
+
+- `auto` (default): the vendor is read with CPUID when the program starts. On AMD (and Hygon)
+  CPUs the function returns 1; on Intel and others it returns the answer of MKL's own function
+  (`dlsym(RTLD_NEXT)`), so MKL behaves exactly as without the library. One image for both.
+- `amd`: always 1. `intel`: the library is not built or linked.
+- At run time, `MKL_VENDOR_OVERRIDE=off` switches the override off (MKL's own check),
+  `MKL_VENDOR_OVERRIDE=on` forces it.
 
 `build.sh` passes the sources as `git archive HEAD`; commit before building.
 
@@ -38,7 +53,7 @@
 ## Running
 
 ```bash
-apptainer exec -B /data --env LD_PRELOAD= gmx-dftbplus-mkl-amd.sif \
+apptainer exec -B /data --env LD_PRELOAD= gmx-dftbplus-mkl.sif \
     gmx mdrun -deffnm md -ntomp 8 -pin on -plumed plumed.dat
 ```
 
