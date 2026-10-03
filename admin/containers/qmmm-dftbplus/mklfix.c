@@ -5,7 +5,7 @@
  * mkl_serv_intel_cpu_true() returns 1, which it does for Intel CPUs only; on AMD CPUs MKL
  * falls back to slower generic paths (MKL_DEBUG_CPU_TYPE has been ignored since MKL 2020.1).
  * This library defines the same symbol and is loaded ahead of MKL (it is a DT_NEEDED of gmx
- * and dftb+, see gmx-dftbplus-mkl.def), so MKL calls this function instead:
+ * and dftb+, see gmx-dftbplus.def), so MKL calls this function instead:
  *   - on AMD (and Hygon) CPUs, found with CPUID, it returns 1;
  *   - on any other CPU it returns what the function of MKL returns (looked up with RTLD_NEXT),
  *     i.e. MKL behaves as without this library;

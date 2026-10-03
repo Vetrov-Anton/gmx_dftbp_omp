@@ -1,6 +1,8 @@
 #!/bin/bash
-# Build the GROMACS + DFTB+ + PLUMED image on Intel MKL for an Intel or an AMD CPU.
+# Build the GROMACS + DFTB+ + PLUMED image on Intel MKL for an Intel or an AMD CPU from this checkout.
+# (Without a checkout: apptainer build --fakeroot gmx-dftbplus-mkl.sif gmx-dftbplus.def clones the sources.)
 #   ./build.sh [auto|amd|intel] [image.sif] [more apptainer build options, e.g. --build-arg GMX_SIMD=AVX_512]
+#   ./build.sh auto gmx-dftbplus-openblas.sif --build-arg BLAS=openblas      # OpenBLAS instead of MKL
 # auto (default): the CPU vendor is detected at run time, the image works on Intel and AMD.
 # The GROMACS sources are those of the current commit (git archive HEAD); uncommitted changes
 # are not included. Needs apptainer >= 1.2 (--build-arg) and --fakeroot.
@@ -14,8 +16,10 @@ top=$(git -C "$here" rev-parse --show-toplevel)
 ctx=$(mktemp -d "${TMPDIR:-/tmp}/gmx-dftbplus-build.XXXXXX")
 trap 'rm -rf "$ctx"' EXIT
 git -C "$top" archive --format=tar.gz --prefix=gromacs/ -o "$ctx/gromacs-src.tar.gz" HEAD
-cp "$here/gmx-dftbplus-mkl.def" "$here/mklfix.c" "$ctx/"
+# The definition file clones the sources from GitHub; with the tarball in the image it uses that.
+cp "$here/gmx-dftbplus.def" "$ctx/"
+printf '\n%%files\n    gromacs-src.tar.gz /opt/src/gromacs-src.tar.gz\n' >> "$ctx/gmx-dftbplus.def"
 echo "Building $out for CPU_VENDOR=$vendor from $(git -C "$top" rev-parse --short HEAD)"
 cd "$ctx"
-apptainer build --fakeroot --build-arg CPU_VENDOR=$vendor --build-arg SRC_TARBALL=gromacs-src.tar.gz "$@" \
-    "$out" gmx-dftbplus-mkl.def
+apptainer build --fakeroot --build-arg CPU_VENDOR=$vendor "$@" \
+    "$out" gmx-dftbplus.def

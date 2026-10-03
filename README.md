@@ -15,20 +15,77 @@ What this repository adds to the original interface:
 - corrected energy of the periodic QM images and the QM/MM virial;
 - diagnostic DFTB output files;
 - OpenMP parallel QM/MM on one MPI rank (works with PLUMED), with OpenBLAS, Intel MKL or AOCL;
-- a container recipe on Intel MKL for Intel and AMD CPUs.
+- a container recipe on Intel MKL (for Intel and AMD CPUs) or OpenBLAS.
 
 | | |
 |---|---|
-| Container image (GROMACS + DFTB+ + PLUMED on MKL) | [admin/containers/qmmm-dftbplus](admin/containers/qmmm-dftbplus/README.md) |
+| Container image (GROMACS + DFTB+ + PLUMED on MKL or OpenBLAS) | [admin/containers/qmmm-dftbplus](admin/containers/qmmm-dftbplus/README.md) |
 | GROMACS itself: README, license | [README](README), [COPYING](COPYING) (LGPL 2.1) |
 
-Contents: [Building](#building) ·
+Contents: [Quick install](#quick-install) ·
+[Building without a container](#building-without-a-container) ·
 [Topology at the QM/MM boundary](#topology-at-the-qmmm-boundary-grompp) ·
 [QM–MM electrostatics at the boundary](#qmmm-electrostatics-at-the-boundary-mdrun) ·
 [DFTB output files](#dftb-output-files-mdrun) ·
 [Parallel runs](#parallel-runs-one-mpi-rank-openmp-threads)
 
-## Building
+## Quick install
+
+One file is enough: the container recipe downloads and builds everything itself (these GROMACS
+sources, DFTB+ 25.1, PLUMED 2.10 with libtorch, and Intel MKL or OpenBLAS). Needs
+[Apptainer](https://apptainer.org) 1.2 or newer and internet access; about half an hour on 8 cores.
+
+```bash
+# 1. get the recipe
+wget https://raw.githubusercontent.com/Vetrov-Anton/gmx_dftbp_omp/main/admin/containers/qmmm-dftbplus/gmx-dftbplus.def
+
+# 2. build the image on Intel MKL (default, the fastest; works on Intel and AMD CPUs)
+apptainer build --fakeroot gmx-dftbplus-mkl.sif gmx-dftbplus.def
+
+#    or on OpenBLAS
+apptainer build --fakeroot --build-arg BLAS=openblas gmx-dftbplus-openblas.sif gmx-dftbplus.def
+
+#    other options: 16 build jobs, AVX-512 instead of the SIMD of the build host
+apptainer build --fakeroot --build-arg NJOBS=16 --build-arg GMX_SIMD=AVX_512 \
+    gmx-dftbplus-mkl.sif gmx-dftbplus.def
+
+# 3. check it
+apptainer test gmx-dftbplus-mkl.sif
+apptainer exec gmx-dftbplus-mkl.sif gmx --version
+apptainer exec gmx-dftbplus-mkl.sif cat /opt/build_config.txt     # BLAS, CPU vendor mode, SIMD, sources
+```
+
+Running (the working directory holds `dftb_in.hsd`; `-B` makes the data directory visible in
+the container):
+
+```bash
+IMG=/path/to/gmx-dftbplus-mkl.sif
+
+# grompp, as usual (QMMM = yes and QMMM-grps in the mdp)
+apptainer exec -B /data $IMG gmx grompp -f md.mdp -p topol.top -n index.ndx -c conf.gro -o md.tpr
+
+# mdrun: QM/MM electrostatics with PME, one MPI rank, 8 OpenMP threads
+apptainer exec -B /data $IMG env GMX_QMMM_VARIANT=1 gmx mdrun -deffnm md -ntomp 8 -pin on
+
+# with a boundary charge scheme and the timing of the QM/MM step every 100 steps
+apptainer exec -B /data $IMG env GMX_QMMM_VARIANT=1 GMX_QMMM_POT_SCHEME=CS GMX_QMMM_TIMING=100 \
+    gmx mdrun -deffnm md -ntomp 8 -pin on
+
+# with PLUMED
+apptainer exec -B /data $IMG env GMX_QMMM_VARIANT=1 gmx mdrun -deffnm md -ntomp 8 -pin on -plumed plumed.dat
+
+# with the report files (off by default in the image)
+apptainer exec -B /data --env GMX_QMMM_REPORTS=on $IMG env GMX_QMMM_VARIANT=1 gmx mdrun -deffnm md -ntomp 8 -pin on
+```
+
+In `dftb_in.hsd`, `Solver = DivideAndConquer {}` in the `Hamiltonian = DFTB` block is the fastest
+eigensolver with MKL. MKL is faster than OpenBLAS (see
+[BLAS/LAPACK of DFTB+](#blaslapack-of-dftb-openblas-mkl-aocl)); the OpenBLAS image is the choice
+when MKL is not wanted. The build arguments and the MKL details are described in
+[admin/containers/qmmm-dftbplus](admin/containers/qmmm-dftbplus/README.md); the sections below
+describe a build without a container and every option.
+
+## Building without a container
 
 DFTB+ has to be installed with its C API and as a shared library:
 
@@ -293,40 +350,47 @@ gmx mdrun -deffnm md -ntomp 8 -pin on -pinoffset 100 -pinstride 2 [-plumed plume
   QM images within them), the QM/MM gradients. The `QM` row of the cycle accounting in
   `md.log` is the DFTB+ part.
 
-Measured on 12165 atoms (TIP3P box, flexible, PME), cores of one Threadripper 3990X,
-ms/step:
+Measured on plasmin in water: 40825 atoms, 109 QM atoms (10 link atoms), DFTB3/3ob with D3 and
+H5, `SCCTolerance = 1e-6`, PME, time step 0.5 fs; MKL, `Solver = DivideAndConquer {}`, cores of
+one Threadripper 3990X. ms per MD step, the best of three runs:
 
-| QM zone | 1 thread | 2 | 4 | 8 | of which at 8 threads: DFTB+ / QM–MM terms |
+| OpenMP threads | 1 | 2 | 4 | 8 | speed-up 1 → 8 |
 |---|---|---|---|---|---|
-| 600 atoms (200 H₂O) | 10064 | 6309 | 4784 | 3987 | 3963 / 58 |
-| 150 atoms (50 H₂O) | 395 | 322 | 320 | 308 | 291 / 19 |
+| whole step | 443 | 282 | 226 | 200 | 2.2× |
+| DFTB+ | 287 | 193 | 169 | 155 | 1.8× |
+| QM–MM electrostatics (potential and gradients) | 41 | 28 | 17 | 12 | 3.4× |
+| MM part (nonbonded, PME, bonded, update) | 116 | 61 | 40 | 32 | 3.6× |
 
-The QM–MM terms scale 5–5.6× on 8 threads; the rest is DFTB+, ~87 % of it the
-diagonalisation (LAPACK), which scales 2.3–2.6× on 8 threads in a standalone DFTB+ run as
-well. A faster threaded LAPACK (e.g. MKL with the GNU OpenMP layer) speeds up exactly that part.
+On 8 threads 78 % of the step is DFTB+: with 109 QM atoms its time goes into the SCC
+iterations (10.9 per step on average) on small matrices, which scale worse than the MM part.
+Giving DFTB+ fewer threads than mdrun does not help: 228 and 234 ms/step with
+`GMX_QMMM_DFTB_NTHREADS` of 4 and 2 against 200 with all 8.
 
 ### BLAS/LAPACK of DFTB+: OpenBLAS, MKL, AOCL
 
-87 % of the DFTB+ time is the diagonalisation, so the LAPACK library and the eigensolver
-matter most. mdrun reports the library it finds (OpenBLAS, Intel MKL or BLIS/libFLAME) and
-sets its thread count to that of DFTB+. There must be **one LAPACK per process**: GROMACS has
+Most of the QM/MM step is DFTB+, so its BLAS/LAPACK library and its eigensolver matter most.
+mdrun reports the library it finds (OpenBLAS, Intel MKL or BLIS/libFLAME of AOCL) and sets its
+thread count to that of DFTB+. There must be **one LAPACK per process**: GROMACS has
 to use the same library as its external BLAS/LAPACK (`GMX_BLAS_USER`/`GMX_LAPACK_USER`);
 with OpenBLAS in libgromacs, DFTB+ calls OpenBLAS, and with the internal LAPACK of GROMACS,
 DFTB+ calls that incomplete copy and crashes (`dlaswp_`).
 
-Measured with 8 threads on 12165 atoms (PME), ms/step, `Solver = DivideAndConquer {}`:
+The same plasmin system as above, ms per MD step, the best of three runs:
 
-| QM zone | OpenBLAS 0.3.26 (OpenMP) | MKL 2020.4 (GNU OpenMP layer) | AOCL 5.0.1 (BLIS + libFLAME) |
+| OpenMP threads | OpenBLAS 0.3.26, `RelativelyRobust` | MKL 2020.4, `RelativelyRobust` | MKL 2020.4, `DivideAndConquer` |
 |---|---|---|---|
-| 600 atoms | 3547 | **2389** | 4153 |
-| 150 atoms | 278 | **221** | 276 |
+| 1 | 490 | 467 | 443 |
+| 2 | 324 | 307 | 282 |
+| 4 | 292 | 256 | 226 |
+| 8 | 272 | 230 | **200** |
 
-With MKL on 600 QM atoms: 8685 / 4778 / 3380 / 2389 ms/step on 1 / 2 / 4 / 8 threads
-(the unmodified code: 9991 ms/step on one thread). Recommended: MKL and
-`Solver = DivideAndConquer {}` in the `Hamiltonian = DFTB` block (1.5× faster diagonalisation
-than the default `RelativelyRobust` with MKL on 8 threads; the energies are the same).
+The code before the OpenMP work: 496 ms/step on one thread. 200 ms/step is 0.217 ns/day.
+Recommended: MKL and `Solver = DivideAndConquer {}` in the
+`Hamiltonian = DFTB` block (the default solver is `RelativelyRobust`; the energies are the same).
+AOCL is recognised as well, but was not faster than OpenBLAS in our tests.
 
 On AMD CPUs, MKL uses its fast code paths only if `mkl_serv_intel_cpu_true()` returns 1; the
-MKL image ([admin/containers/qmmm-dftbplus](admin/containers/qmmm-dftbplus/README.md)) makes a library with that function a `DT_NEEDED` of
-`gmx` and `dftb+`. mdrun prints which paths MKL takes. Without it, MKL is slower than
-OpenBLAS (3474 instead of 2495 ms/step above).
+MKL image ([admin/containers/qmmm-dftbplus](admin/containers/qmmm-dftbplus/README.md)) makes a
+library with that function a `DT_NEEDED` of `gmx` and `dftb+`. mdrun prints which paths MKL
+takes. Without it, MKL is slower than OpenBLAS (measured on a QM zone of 600 atoms: 3474 instead
+of 2495 ms/step).
