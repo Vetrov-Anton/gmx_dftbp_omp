@@ -64,7 +64,13 @@ macro(gmx_manage_dftbplus)
         get_filename_component(_gmx_dftbp_parent "${_gmx_dftbp_given}" DIRECTORY)
         list(APPEND _gmx_dftbp_hints "${_gmx_dftbp_given}" "${_gmx_dftbp_parent}")
     endif()
+    # The package of DFTB+ looks up its own dependencies (s-dftd3, tblite, mctc-lib, ...) with
+    # find_dependency(), which does not see the HINTS: put the prefix on CMAKE_PREFIX_PATH
+    # while it is found, so that a DFTB+ installed anywhere works without environment variables.
+    set(_gmx_dftbp_saved_prefix_path "${CMAKE_PREFIX_PATH}")
+    list(PREPEND CMAKE_PREFIX_PATH ${_gmx_dftbp_hints})
     find_package(DftbPlus CONFIG REQUIRED HINTS ${_gmx_dftbp_hints})
+    set(CMAKE_PREFIX_PATH "${_gmx_dftbp_saved_prefix_path}")
 
     # Not every version puts dftbplus.h into the include directories of its target
     get_filename_component(_gmx_dftbp_prefix "${DftbPlus_DIR}/../../.." ABSOLUTE)
