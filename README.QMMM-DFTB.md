@@ -147,7 +147,7 @@ QM/MM electrostatics with the boundary charge scheme CS: 1 MM1 charges removed, 
 ```
 
 and writes the link atoms, the removed MM1 charges, the `AMBER` shares and the fictitious
-charges to `qmmm_exclusion_report.txt` (`GMX_QMMM_EXCLUSION_REPORT`, `GMX_QMMM_REPORTS=off`).
+charges to `qmmm_redistribution_report.txt` (`GMX_QMMM_REDISTRIBUTION_REPORT`, `GMX_QMMM_REPORTS=off`).
 
 ### `GMX_QMMM_VARIANT`
 

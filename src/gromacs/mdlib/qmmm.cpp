@@ -1640,15 +1640,15 @@ void QMMM_rec::init_QMMM_boundary(const gmx_mtop_t* mtop)
 
     if (qmmmReportsEnabled())
     {
-        const char* reportFile = getenv("GMX_QMMM_EXCLUSION_REPORT");
+        const char* reportFile = getenv("GMX_QMMM_REDISTRIBUTION_REPORT");
         if (reportFile == nullptr)
         {
-            reportFile = "qmmm_exclusion_report.txt";
+            reportFile = "qmmm_redistribution_report.txt";
         }
         writeQmmmChargeReport(*mtop, *this, bQM, reportFile);
         fprintf(stdout,
                 "The QM/MM boundary charge scheme is listed atom by atom in %s\n"
-                "  (file name set with GMX_QMMM_EXCLUSION_REPORT, switched off with GMX_QMMM_REPORTS=off).\n",
+                "  (file name set with GMX_QMMM_REDISTRIBUTION_REPORT, switched off with GMX_QMMM_REPORTS=off).\n",
                 reportFile);
     }
 }
