@@ -2,12 +2,15 @@
 
 `gmx-dftbplus-mkl.def` builds, from `ubuntu:24.04`:
 
-- GROMACS from this tree (the commit `build.sh` is run from), double precision, OpenMPI,
+- GROMACS from this repository, https://github.com/Vetrov-Anton/gmx_dftbp_omp (the commit
+  `build.sh` is run from), double precision, OpenMPI,
   OpenMP, with the PLUMED patch for GROMACS 2026 and MKL as its BLAS/LAPACK;
 - DFTB+ 25.1 (C API, OpenMP, shared) on MKL (`mkl_gnu_thread`: the OpenMP pool of mdrun);
 - PLUMED v2.10 with libtorch (runtime-loaded through `PLUMED_KERNEL`).
 
 ```bash
+git clone https://github.com/Vetrov-Anton/gmx_dftbp_omp.git      # branch main
+cd gmx_dftbp_omp/admin/containers/qmmm-dftbplus
 ./build.sh                                      # -> gmx-dftbplus-mkl.sif, works on Intel and AMD
 ./build.sh auto gmx-zen4.sif --build-arg GMX_SIMD=AVX_512 --build-arg NJOBS=16
 ```

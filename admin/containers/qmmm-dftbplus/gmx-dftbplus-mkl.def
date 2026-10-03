@@ -2,7 +2,8 @@ Bootstrap: docker
 From: ubuntu:24.04
 
 # ---------------------------------------------------------------------------
-# GROMACS (this tree: Kubar's DFTB+ QM/MM with the one-rank OpenMP work) + DFTB+ + PLUMED,
+# GROMACS (this repository, https://github.com/Vetrov-Anton/gmx_dftbp_omp: Kubar's DFTB+ QM/MM
+# with the one-rank OpenMP work) + DFTB+ + PLUMED,
 # all on Intel MKL, for Intel and AMD CPUs. Build with build.sh next to this file:
 #
 #   ./build.sh                       gmx-dftbplus-mkl.sif     # CPU vendor detected at run time
@@ -157,6 +158,7 @@ From: ubuntu:24.04
 
 %help
     GROMACS (Kubar DFTB+ QM/MM, one-rank OpenMP) + DFTB+ + PLUMED on Intel MKL.
+    Sources: https://github.com/Vetrov-Anton/gmx_dftbp_omp
     cat /opt/build_config.txt shows the CPU vendor and SIMD the image was built for.
 
         apptainer exec -B /data --env LD_PRELOAD= image.sif \
