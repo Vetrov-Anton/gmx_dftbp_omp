@@ -116,9 +116,10 @@ From: ubuntu:24.04
         -DGMX_USE_PLUMED=ON -DGMX_QMMM_PROGRAM=dftbplus -DGMX_QMMM_DFTBPLUS_LIB=/opt/dftbplus
     cmake --build build -j ${NJOBS}
     cmake --install build
-    SIMD_USED=$(grep "^GMX_SIMD_ACTIVE:" build/CMakeCache.txt | cut -d= -f2)
-    BUILD_HOST_CPU=$(grep -m1 "^vendor_id" /proc/cpuinfo | awk '{print $3}')
-    printf "CPU_VENDOR=%s\nGMX_SIMD=%s\nbuild host CPU=%s\n" ${CPU_VENDOR} ${SIMD_USED} ${BUILD_HOST_CPU} > /opt/build_config.txt
+    # GMX_SIMD=AUTO stays AUTO in the cache; the SIMD chosen is kept in *_PREVIOUS_VALUE
+    SIMD_USED=$(grep -E "^GMX_SIMD_ACTIVE_PREVIOUS_VALUE:" build/CMakeCache.txt | cut -d= -f2)
+    BUILD_HOST_CPU=$(grep -m1 "^model name" /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')
+    printf "CPU_VENDOR=%s\nGMX_SIMD=%s\nbuild host CPU=%s\n" "${CPU_VENDOR}" "${SIMD_USED:-unknown}" "${BUILD_HOST_CPU:-unknown}" > /opt/build_config.txt
     cd /opt/src && rm -rf gromacs gromacs-src.tar.gz
     export LD_LIBRARY_PATH=/opt/gmx/lib:${LD_LIBRARY_PATH}
     if ldd /opt/gmx/bin/gmx | grep -q openblas; then echo "ERROR: OpenBLAS loaded by gmx"; exit 1; fi
