@@ -280,3 +280,29 @@ ms/step:
 The QM–MM terms scale 5–5.6× on 8 threads; the rest is DFTB+, ~87 % of it the
 diagonalisation (LAPACK), which scales 2.3–2.6× on 8 threads in a standalone DFTB+ run as
 well. A faster threaded LAPACK (e.g. MKL with the GNU OpenMP layer) speeds up exactly that part.
+
+### BLAS/LAPACK of DFTB+: OpenBLAS, MKL, AOCL
+
+87 % of the DFTB+ time is the diagonalisation, so the LAPACK library and the eigensolver
+matter most. mdrun reports the library it finds (OpenBLAS, Intel MKL or BLIS/libFLAME) and
+sets its thread count to that of DFTB+. There must be **one LAPACK per process**: GROMACS has
+to use the same library as its external BLAS/LAPACK (`GMX_BLAS_USER`/`GMX_LAPACK_USER`);
+with OpenBLAS in libgromacs, DFTB+ calls OpenBLAS, and with the internal LAPACK of GROMACS,
+DFTB+ calls that incomplete copy and crashes (`dlaswp_`).
+
+Measured with 8 threads on 12165 atoms (PME), ms/step, `Solver = DivideAndConquer {}`:
+
+| QM zone | OpenBLAS 0.3.26 (OpenMP) | MKL 2020.4 (GNU OpenMP layer) | AOCL 5.0.1 (BLIS + libFLAME) |
+|---|---|---|---|
+| 600 atoms | 3547 | **2389** | 4153 |
+| 150 atoms | 278 | **221** | 276 |
+
+With MKL on 600 QM atoms: 8685 / 4778 / 3380 / 2389 ms/step on 1 / 2 / 4 / 8 threads
+(the unmodified code: 9991 ms/step on one thread). Recommended: MKL and
+`Solver = DivideAndConquer {}` in the `Hamiltonian = DFTB` block (1.5× faster diagonalisation
+than the default `RelativelyRobust` with MKL on 8 threads; the energies are the same).
+
+On AMD CPUs, MKL uses its fast code paths only if `mkl_serv_intel_cpu_true()` returns 1; the
+MKL image (`gmx_kubar_dftb25_mkl.def`) makes a library with that function a `DT_NEEDED` of
+`gmx` and `dftb+`. mdrun prints which paths MKL takes. Without it, MKL is slower than
+OpenBLAS (3474 instead of 2495 ms/step above).

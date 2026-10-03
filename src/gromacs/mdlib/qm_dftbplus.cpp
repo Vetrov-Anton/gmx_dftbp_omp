@@ -276,6 +276,10 @@ static void setUpDftbBlasThreads(int numThreads)
         {
             char version[256] = { 0 };
             mklVersion(version, sizeof(version) - 1);
+            for (int i = static_cast<int>(strlen(version)) - 1; i >= 0 && version[i] == ' '; i--)
+            {
+                version[i] = '\0';
+            }
             if (mklThreads != nullptr)
             {
                 mklThreads(numThreads);
